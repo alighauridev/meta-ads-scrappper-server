@@ -57,9 +57,6 @@ function runScrape({ term, max, country, enrichPage, classify }, outPath, tag = 
     "--max", String(max || 50),
     "--country", country || "US",
     "--idle", "12",
-    // One browser context at a time — keeps Chromium under the memory ceiling
-    // on small hosts (e.g. Render Starter ~512MB). Override with SCRAPE_CONCURRENCY.
-    "--concurrency", String(process.env.SCRAPE_CONCURRENCY || 1),
     "--out", outPath,
   ];
   if (enrichPage) args.push("--enrich-page");
