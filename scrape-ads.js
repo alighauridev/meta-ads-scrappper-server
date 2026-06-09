@@ -351,10 +351,12 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   const page = await context.newPage();
 
   const rawNodes = [];
+  let gqlResponses = 0; // how many GraphQL responses we saw (diagnostic)
   // Intercept every GraphQL response and pull ad nodes out of the JSON.
   page.on("response", async (response) => {
     const url = response.url();
     if (!url.includes("/api/graphql") && !url.includes("/graphql")) return;
+    gqlResponses++;
     if (response.status() !== 200) return;
     try {
       const text = await response.text();
@@ -375,6 +377,19 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   } catch {
     // networkidle can time out on a busy page; we still have whatever loaded
   }
+
+  // Best-effort: dismiss Facebook's cookie-consent dialog. If left open it can
+  // block the search from ever firing its GraphQL calls (a common reason a
+  // fresh/datacenter session returns 0 results).
+  try {
+    const consent = page.getByRole("button", {
+      name: /allow all cookies|accept all|allow essential|only allow essential|accept/i,
+    });
+    if (await consent.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+      await consent.first().click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+    }
+  } catch { /* no dialog */ }
 
   let idleScrolls = 0;
   while (results.size < cfg.max && idleScrolls < cfg.maxIdleScrolls) {
@@ -398,6 +413,29 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     // scroll to trigger the next GraphQL pagination batch
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(cfg.scrollDelayMs);
+  }
+
+  // When a term yields nothing, report WHAT the page showed so we can tell a
+  // genuine "no ads" from a login wall / block / unaccepted consent (typical
+  // when Facebook serves a datacenter IP differently than a residential one).
+  if (results.size === 0) {
+    let title = "", bodyText = "", finalUrl = "";
+    try { finalUrl = page.url(); } catch {}
+    try { title = await page.title(); } catch {}
+    try { bodyText = (await page.evaluate(() => document.body?.innerText || "")).slice(0, 400); } catch {}
+    const lc = bodyText.toLowerCase();
+    const signal =
+      /log in|log into facebook|you must log in|create new account/.test(lc) ? "LOGIN WALL (IP likely blocked)" :
+      /allow.*cookies|cookies policy|accept cookies/.test(lc) ? "COOKIE CONSENT not dismissed" :
+      /isn'?t available|not available|something went wrong|try again later/.test(lc) ? "BLOCKED / UNAVAILABLE" :
+      /no ads? match/.test(lc) ? "GENUINELY EMPTY (no ads match)" :
+      gqlResponses === 0 ? "NO GraphQL fired (page never searched — blocked/JS-gated)" :
+      "UNKNOWN (GraphQL fired but returned no ad nodes)";
+    console.log(
+      `  [${term}] 0 leads — diagnostic: ${signal} | graphqlResponses=${gqlResponses}` +
+      ` | title="${title}" | url=${finalUrl}`,
+    );
+    console.log(`  [${term}] page text: ${bodyText.replace(/\s+/g, " ").trim().slice(0, 250)}`);
   }
 
   await context.close();
