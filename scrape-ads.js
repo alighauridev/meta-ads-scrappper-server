@@ -351,7 +351,9 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   const page = await context.newPage();
 
   const rawNodes = [];
-  let gqlResponses = 0; // how many GraphQL responses we saw (diagnostic)
+  let gqlResponses = 0;   // how many GraphQL responses we saw (diagnostic)
+  let gqlWithAdData = 0;  // how many of them actually contained ad data
+  let gqlReadErrors = 0;  // how many response bodies we failed to read
   // Intercept every GraphQL response and pull ad nodes out of the JSON.
   page.on("response", async (response) => {
     const url = response.url();
@@ -360,11 +362,13 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     if (response.status() !== 200) return;
     try {
       const text = await response.text();
+      if (text.includes("ad_archive_id") || text.includes("adArchiveID")) gqlWithAdData++;
       for (const obj of parseGraphQLBody(text)) {
         extractAdNodes(obj, rawNodes);
       }
     } catch {
       // body already consumed / non-text — ignore
+      gqlReadErrors++;
     }
   });
 
@@ -433,10 +437,18 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
       /no ads? match/.test(lc) ? "GENUINELY EMPTY (no ads match this search)" :
       gqlResponses === 0 ? "NO GraphQL fired (page never searched — blocked/JS-gated)" :
       "RESULTS SUPPRESSED — search ran but returned no ads (datacenter IP likely; set a residential PROXY_URL)";
+    // Decisive split: did ANY GraphQL body actually carry ad data?
+    const dataSignal =
+      gqlWithAdData > 0
+        ? `FB RETURNED AD DATA in ${gqlWithAdData} response(s) but parser extracted 0 — PARSING ISSUE (proxy won't help)`
+        : gqlReadErrors > 0
+        ? `${gqlReadErrors} response bodies unreadable — could not inspect (try again)`
+        : "NO response contained ad data — FB returned empty results (IP suppression; residential PROXY_URL needed)";
     console.log(
       `  [${term}] 0 leads — diagnostic: ${signal} | graphqlResponses=${gqlResponses}` +
-      ` | title="${title}" | url=${finalUrl}`,
+      ` | withAdData=${gqlWithAdData} | readErrors=${gqlReadErrors} | title="${title}" | url=${finalUrl}`,
     );
+    console.log(`  [${term}] verdict: ${dataSignal}`);
     console.log(`  [${term}] page text: ${bodyText.replace(/\s+/g, " ").trim().slice(0, 250)}`);
   }
 
