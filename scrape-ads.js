@@ -424,13 +424,15 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     try { title = await page.title(); } catch {}
     try { bodyText = (await page.evaluate(() => document.body?.innerText || "")).slice(0, 400); } catch {}
     const lc = bodyText.toLowerCase();
+    // NOTE: a bare "log in" link is ALWAYS in the Ads Library header — it is not
+    // evidence of a wall. Only treat explicit "must log in" prompts as a wall.
     const signal =
-      /log in|log into facebook|you must log in|create new account/.test(lc) ? "LOGIN WALL (IP likely blocked)" :
+      /you must log in|log in to continue|log in to see/.test(lc) ? "LOGIN REQUIRED (IP flagged)" :
       /allow.*cookies|cookies policy|accept cookies/.test(lc) ? "COOKIE CONSENT not dismissed" :
       /isn'?t available|not available|something went wrong|try again later/.test(lc) ? "BLOCKED / UNAVAILABLE" :
-      /no ads? match/.test(lc) ? "GENUINELY EMPTY (no ads match)" :
+      /no ads? match/.test(lc) ? "GENUINELY EMPTY (no ads match this search)" :
       gqlResponses === 0 ? "NO GraphQL fired (page never searched — blocked/JS-gated)" :
-      "UNKNOWN (GraphQL fired but returned no ad nodes)";
+      "RESULTS SUPPRESSED — search ran but returned no ads (datacenter IP likely; set a residential PROXY_URL)";
     console.log(
       `  [${term}] 0 leads — diagnostic: ${signal} | graphqlResponses=${gqlResponses}` +
       ` | title="${title}" | url=${finalUrl}`,
@@ -635,11 +637,26 @@ async function main() {
   console.log(`Scraping ${terms.length} term(s), target ${cfg.max} unique/term, ` +
     `concurrency ${cfg.concurrency}, dedup against ${seenKeys.size} existing.`);
 
+  // Optional residential proxy. Facebook suppresses Ads Library results for
+  // datacenter IPs (e.g. Render/AWS), so on a server you typically MUST route
+  // through a residential proxy. Set PROXY_URL (and PROXY_USERNAME/PASSWORD).
+  //   PROXY_URL=http://gw.example.com:7000
+  const proxy = process.env.PROXY_URL
+    ? {
+        server: process.env.PROXY_URL,
+        ...(process.env.PROXY_USERNAME
+          ? { username: process.env.PROXY_USERNAME, password: process.env.PROXY_PASSWORD }
+          : {}),
+      }
+    : undefined;
+  if (proxy) console.log(`Using proxy ${proxy.server}`);
+
   // --no-sandbox is required when running as root inside a container (Render,
   // Docker, CI); Chromium otherwise refuses to launch. Harmless locally.
   const browser = await chromium.launch({
     headless: cfg.headless,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    ...(proxy ? { proxy } : {}),
   });
 
   const perTerm = await pool(terms, cfg.concurrency, async (term) => {
