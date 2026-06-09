@@ -597,7 +597,12 @@ async function main() {
   console.log(`Scraping ${terms.length} term(s), target ${cfg.max} unique/term, ` +
     `concurrency ${cfg.concurrency}, dedup against ${seenKeys.size} existing.`);
 
-  const browser = await chromium.launch({ headless: cfg.headless });
+  // --no-sandbox is required when running as root inside a container (Render,
+  // Docker, CI); Chromium otherwise refuses to launch. Harmless locally.
+  const browser = await chromium.launch({
+    headless: cfg.headless,
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+  });
 
   const perTerm = await pool(terms, cfg.concurrency, async (term) => {
     const t0 = Date.now();
