@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Meta Ads Library — Leads Table</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-2: #1f232c;
+    --row-alt: #14171d;
+    --border: #2a2f3a;
+    --text: #e6e9ef;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --green: #2ecc71;
+    --amber: #f5a623;
+    --pink: #ff5d8f;
+    --purple: #b388ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  header {
+    flex: 0 0 auto;
+    border-bottom: 1px solid var(--border);
+    padding: 14px 20px;
+    background: var(--bg);
+  }
+  .title-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .controls { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  input[type="search"], select {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+  }
+  input[type="search"] { flex: 1; min-width: 220px; }
+  input[type="search"]:focus, select:focus { border-color: var(--accent); }
+  button.tool {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; cursor: pointer;
+  }
+  button.tool:hover { border-color: var(--accent); }
+  .stats { color: var(--muted); font-size: 12px; margin-left: auto; }
+
+  .table-wrap { flex: 1 1 auto; overflow: auto; position: relative; }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; }
+  thead th {
+    position: sticky; top: 0; z-index: 5;
+    background: var(--panel);
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  thead th:hover { color: var(--text); }
+  thead th .arrow { font-size: 10px; opacity: .5; margin-left: 4px; }
+  thead th.sorted .arrow { opacity: 1; color: var(--accent); }
+  tbody td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    max-width: 360px;
+  }
+  tbody tr:nth-child(even) { background: var(--row-alt); }
+  tbody tr:hover { background: var(--panel-2); }
+  .col-idx { color: var(--muted); text-align: right; width: 36px; font-variant-numeric: tabular-nums; }
+  .col-num { text-align: right; font-variant-numeric: tabular-nums; }
+  .col-company { font-weight: 600; min-width: 140px; }
+  .col-body { color: #c8cedb; line-height: 1.45; min-width: 280px; }
+  .truncate { display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  td.expandable { cursor: pointer; }
+  td.expandable.open .truncate { -webkit-line-clamp: unset; line-clamp: unset; }
+  a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  a:hover { text-decoration: underline; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--muted); }
+  .pill {
+    display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .pill.term { color: var(--purple); border-color: rgba(179,136,255,.4); }
+  .pill.cta { color: var(--accent); border-color: rgba(79,140,255,.4); }
+  .pill.opt-in { color: var(--green); border-color: rgba(46,204,113,.4); }
+  .pill.vsl { color: var(--amber); border-color: rgba(245,166,35,.4); }
+  .pill.booking { color: var(--pink); border-color: rgba(255,93,143,.4); }
+  .empty, .loader { text-align: center; color: var(--muted); padding: 80px 20px; }
+  code { background: var(--panel-2); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title-row">
+    <h1>Meta Ads Library — Leads</h1>
+    <span class="sub" id="source-note"></span>
+  </div>
+  <div class="controls">
+    <input type="search" id="search" placeholder="Search any field…" />
+    <select id="term-filter"><option value="">All terms</option></select>
+    <select id="type-filter"><option value="">All page types</option></select>
+    <button class="tool" id="upload-btn">Upload JSON</button>
+    <input type="file" id="file-input" accept=".json,application/json" style="display:none" />
+    <button class="tool" id="csv-btn">Export CSV</button>
+    <span class="stats" id="stats"></span>
+  </div>
+</header>
+<div class="table-wrap" id="content"><div class="loader">Loading leads.json…</div></div>
+
+<script>
+// Preferred columns with custom rendering. Any field present in the data but
+// NOT listed here is appended automatically (see buildColumns), so the table
+// always shows every field — nothing is ever silently dropped.
+const KNOWN_COLUMNS = [
+  { key: "_idx",            label: "#",             cls: "col-idx" },
+  { key: "companyName",     label: "Company",       cls: "col-company" },
+  { key: "displayUrl",      label: "Display URL" },
+  { key: "website",         label: "Website",       render: linkCell },
+  { key: "companyPhone",    label: "Phone",         render: phoneCell },
+  { key: "cta",             label: "CTA",           render: v => v ? `<span class="pill cta">${esc(v)}</span>` : "" },
+  { key: "pageType",        label: "Page Type",     render: v => v ? `<span class="pill ${esc(v)}">${esc(v)}</span>` : "" },
+  { key: "activeAdCount",   label: "Active Ads",    cls: "col-num", render: v => (v ?? "") === "" ? "" : `<span class="mono">${esc(v)}</span>` },
+  { key: "sourceTerm",      label: "Term",          render: v => v ? `<span class="pill term">${esc(v)}</span>` : "" },
+  { key: "adCopySnippet",   label: "Ad Copy",       cls: "col-body", expandable: true },
+  { key: "landingPage",     label: "Landing Page",  render: linkCell },
+  { key: "fbAdLink",        label: "Ad Creative",   render: v => v ? `<a href="${esc(v)}" target="_blank" rel="noopener">open ↗</a>` : "" },
+  { key: "facebookProfile", label: "Facebook",      render: v => v ? `<a href="${esc(v)}" target="_blank" rel="noopener">open ↗</a>` : "" },
+  { key: "instagramProfile",label: "Instagram",     render: v => v ? `<a href="${esc(v)}" target="_blank" rel="noopener">open ↗</a>` : "" },
+  { key: "facebookPageId",  label: "Page ID",       render: v => v ? `<span class="mono">${esc(v)}</span>` : "" },
+  { key: "adArchiveId",     label: "Archive ID",    render: v => v ? `<span class="mono">${esc(v)}</span>` : "" },
+];
+
+const state = { leads: [], filtered: [], columns: [], sortKey: null, sortDir: 1 };
+
+// Turn an unknown key like "companyPhone" into a label like "Company Phone".
+function humanize(key) {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// Build the column list from the data: keep KNOWN_COLUMNS order/rendering, then
+// append any extra fields found in the leads as generic auto-detected columns.
+function buildColumns() {
+  const known = new Set(KNOWN_COLUMNS.map(c => c.key));
+  const cols = KNOWN_COLUMNS.slice();
+  const seen = new Set();
+  for (const lead of state.leads) {
+    for (const key of Object.keys(lead)) {
+      if (known.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      cols.push({ key, label: humanize(key), render: autoCell });
+    }
+  }
+  state.columns = cols;
+}
+
+// Generic renderer for auto-detected fields: links for URLs, plain text otherwise.
+function autoCell(v) {
+  if (v === null || v === undefined || v === "") return "";
+  if (typeof v === "object") return `<span class="mono">${esc(JSON.stringify(v))}</span>`;
+  if (/^https?:\/\//i.test(String(v))) return linkCell(String(v));
+  return esc(v);
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => (
+    { "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]
+  ));
+}
+function domainOf(url) { try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; } }
+function linkCell(v) {
+  if (!v) return "";
+  const d = domainOf(v) || "link";
+  return `<a href="${esc(v)}" target="_blank" rel="noopener" title="${esc(v)}">${esc(d)} ↗</a>`;
+}
+function phoneCell(v) {
+  if (!v) return "";
+  const digits = String(v).replace(/[^\d+]/g, "");
+  const pretty = digits.startsWith("+") ? digits : "+" + digits;
+  return `<a href="tel:${esc(digits)}">${esc(pretty)}</a>`;
+}
+
+function render() {
+  const list = state.filtered;
+  document.getElementById("stats").textContent = `${list.length} of ${state.leads.length} leads`;
+  const content = document.getElementById("content");
+
+  if (!list.length) { content.innerHTML = `<div class="empty">No leads match your filters.</div>`; return; }
+
+  const head = state.columns.map(c => {
+    const sorted = state.sortKey === c.key;
+    const arrow = sorted ? (state.sortDir === 1 ? "▲" : "▼") : "↕";
+    return `<th data-key="${c.key}" class="${sorted ? "sorted" : ""}">${esc(c.label)}<span class="arrow">${arrow}</span></th>`;
+  }).join("");
+
+  const rows = list.map((l, i) => {
+    const tds = state.columns.map(c => {
+      const raw = c.key === "_idx" ? (i + 1) : l[c.key];
+      let inner = c.render ? c.render(raw, l) : esc(raw ?? "");
+      if (c.expandable && raw) inner = `<div class="truncate">${esc(raw)}</div>`;
+      const expandable = c.expandable && raw ? " expandable" : "";
+      return `<td class="${c.cls || ""}${expandable}">${inner}</td>`;
+    }).join("");
+    return `<tr>${tds}</tr>`;
+  }).join("");
+
+  content.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+
+  content.querySelectorAll("thead th").forEach(th =>
+    th.addEventListener("click", () => sortBy(th.dataset.key)));
+  content.querySelectorAll("td.expandable").forEach(td =>
+    td.addEventListener("click", () => td.classList.toggle("open")));
+}
+
+function sortBy(key) {
+  if (state.sortKey === key) state.sortDir *= -1;
+  else { state.sortKey = key; state.sortDir = 1; }
+  applyFilters();
+}
+
+function applyFilters() {
+  const q = document.getElementById("search").value.toLowerCase().trim();
+  const term = document.getElementById("term-filter").value;
+  const type = document.getElementById("type-filter").value;
+
+  let list = state.leads.filter(l => {
+    if (term && l.sourceTerm !== term) return false;
+    if (type && l.pageType !== type) return false;
+    if (q) {
+      const hay = Object.values(l).join(" ").toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  if (state.sortKey && state.sortKey !== "_idx") {
+    const k = state.sortKey, dir = state.sortDir;
+    list.sort((a, b) => String(a[k] ?? "").localeCompare(String(b[k] ?? ""), undefined, { numeric: true }) * dir);
+  }
+
+  state.filtered = list;
+  render();
+}
+
+function populateFilters() {
+  const terms = [...new Set(state.leads.map(l => l.sourceTerm).filter(Boolean))].sort();
+  const types = [...new Set(state.leads.map(l => l.pageType).filter(Boolean))].sort();
+  const tf = document.getElementById("term-filter");
+  terms.forEach(t => tf.insertAdjacentHTML("beforeend", `<option value="${esc(t)}">${esc(t)}</option>`));
+  const yf = document.getElementById("type-filter");
+  if (types.length) types.forEach(t => yf.insertAdjacentHTML("beforeend", `<option value="${esc(t)}">${esc(t)}</option>`));
+  else yf.style.display = "none";
+}
+
+function exportCSV() {
+  const cols = state.columns.filter(c => c.key !== "_idx");
+  const escCsv = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const header = cols.map(c => escCsv(c.label)).join(",");
+  const rows = state.filtered.map(l => cols.map(c => escCsv(l[c.key])).join(","));
+  const blob = new Blob(["﻿" + [header, ...rows].join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "leads.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// Reset the table for a freshly loaded dataset (from fetch or file upload).
+function setLeads(leads, sourceLabel) {
+  if (!Array.isArray(leads)) throw new Error("JSON must be an array of leads");
+  state.leads = leads;
+  state.sortKey = null;
+  state.sortDir = 1;
+  document.getElementById("source-note").textContent = `${leads.length} leads from ${sourceLabel}`;
+  // rebuild filter dropdowns from scratch
+  const tf = document.getElementById("term-filter");
+  const yf = document.getElementById("type-filter");
+  tf.innerHTML = `<option value="">All terms</option>`;
+  yf.innerHTML = `<option value="">All page types</option>`;
+  yf.style.display = "";
+  document.getElementById("search").value = "";
+  buildColumns();
+  populateFilters();
+  applyFilters();
+}
+
+async function load() {
+  try {
+    const res = await fetch("leads.json", { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status + " " + res.statusText);
+    setLeads(await res.json(), "leads.json");
+  } catch (e) {
+    document.getElementById("content").innerHTML = `
+      <div class="empty">
+        <p>Couldn't auto-load <code>leads.json</code>: ${esc(e.message)}</p>
+        <p>Use the <b>Upload JSON</b> button above to pick any file (e.g. <code>leads-1000.json</code>) —
+        that works even when opening this page directly.</p>
+        <p>Or serve the folder so <code>leads.json</code> loads automatically:<br>
+        <code>npx serve</code> &nbsp;or&nbsp; <code>python -m http.server</code></p>
+      </div>`;
+  }
+}
+
+function handleFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      setLeads(JSON.parse(reader.result), file.name);
+    } catch (e) {
+      alert(`Could not parse ${file.name}: ${e.message}`);
+    }
+  };
+  reader.readAsText(file);
+}
+
+["search","term-filter","type-filter"].forEach(id =>
+  document.getElementById(id).addEventListener("input", applyFilters));
+document.getElementById("csv-btn").addEventListener("click", exportCSV);
+document.getElementById("upload-btn").addEventListener("click", () =>
+  document.getElementById("file-input").click());
+document.getElementById("file-input").addEventListener("change", e =>
+  handleFile(e.target.files[0]));
+
+load();
+</script>
+</body>
+</html>

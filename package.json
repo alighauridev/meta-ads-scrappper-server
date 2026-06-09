@@ -1,0 +1,16 @@
+{
+  "name": "meta-ads-scraper",
+  "version": "0.1.0",
+  "description": "Meta Ads Library scraper via GraphQL intercept (replaces the Manus trial-and-error flow)",
+  "type": "module",
+  "main": "scrape-ads.js",
+  "scripts": {
+    "scrape": "node scrape-ads.js",
+    "serve": "node server.js",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "express": "^4.22.2",
+    "playwright": "^1.49.0"
+  }
+}
