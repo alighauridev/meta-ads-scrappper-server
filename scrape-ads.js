@@ -381,21 +381,39 @@ function loadProxies() {
   return out;
 }
 
-function pickProxy(proxies) {
-  if (!proxies || !proxies.length) return undefined;
-  return proxies[Math.floor(Math.random() * proxies.length)];
+function proxyKey(p) {
+  return p ? `${p.server}|${p.username || ""}` : "";
 }
 
-// Abort image/video/font requests for every page in a context. We only need the
-// GraphQL JSON (and the page's scripts to fire it), never the rendered media, so
-// this cuts proxy bandwidth ~70-90% — critical on per-GB residential proxies.
-// Safe for classify too: <video>/<iframe> DOM elements still exist; we just don't
-// download their bytes. Set NO_BLOCK_MEDIA=1 to disable.
+// Pick a random proxy, preferring one not already tried this round so retries
+// don't waste an attempt on the same bad IP.
+function pickProxy(proxies, tried) {
+  if (!proxies || !proxies.length) return undefined;
+  const untried = tried ? proxies.filter((p) => !tried.has(proxyKey(p))) : proxies;
+  const pool = untried.length ? untried : proxies;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// Abort everything we don't need — images, video, fonts, CSS — for every page in
+// a context. We only need the page's scripts (to fire the search) and the GraphQL
+// JSON; nothing is rendered/looked at visually. This cuts proxy bandwidth ~90%+ —
+// critical on per-GB residential proxies. Safe for classify: <video>/<iframe> DOM
+// elements still exist; we just skip their bytes. Set NO_BLOCK_MEDIA=1 to disable.
+const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font", "stylesheet"]);
+// Facebook STREAMS ad-preview videos via fetch/XHR (MSE/DASH), so they're typed
+// "fetch" and dodge the resourceType filter — they were the real hogs (100-230MB
+// each). Block them by URL instead. The video CDN is never needed; the ad's video
+// link is just a string in the GraphQL JSON we read from facebook.com.
+function isHeavyUrl(u) {
+  return /video[\w.-]*\.fbcdn\.net/i.test(u) || /\.mp4(\?|$)/i.test(u);
+}
 async function blockHeavyAssets(context) {
   if (process.env.NO_BLOCK_MEDIA) return;
   await context.route("**/*", (route) => {
-    const t = route.request().resourceType();
-    if (t === "image" || t === "media" || t === "font") return route.abort();
+    const req = route.request();
+    if (BLOCKED_RESOURCE_TYPES.has(req.resourceType()) || isHeavyUrl(req.url())) {
+      return route.abort();
+    }
     return route.continue();
   });
 }
@@ -436,8 +454,10 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   // actually fired — otherwise we rotate to another IP. domcontentloaded (not
   // networkidle) for the nav so a slow proxy doesn't fail the goto outright.
   let context = null, page = null, ready = false;
+  const tried = new Set();
   for (let attempt = 1; attempt <= 5 && !ready; attempt++) {
-    const proxy = pickProxy(cfg.proxies);
+    const proxy = pickProxy(cfg.proxies, tried);
+    if (proxy) tried.add(proxyKey(proxy));
     context = await browser.newContext({
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
