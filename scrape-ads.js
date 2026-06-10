@@ -386,6 +386,20 @@ function pickProxy(proxies) {
   return proxies[Math.floor(Math.random() * proxies.length)];
 }
 
+// Abort image/video/font requests for every page in a context. We only need the
+// GraphQL JSON (and the page's scripts to fire it), never the rendered media, so
+// this cuts proxy bandwidth ~70-90% — critical on per-GB residential proxies.
+// Safe for classify too: <video>/<iframe> DOM elements still exist; we just don't
+// download their bytes. Set NO_BLOCK_MEDIA=1 to disable.
+async function blockHeavyAssets(context) {
+  if (process.env.NO_BLOCK_MEDIA) return;
+  await context.route("**/*", (route) => {
+    const t = route.request().resourceType();
+    if (t === "image" || t === "media" || t === "font") return route.abort();
+    return route.continue();
+  });
+}
+
 // ---------------------------------------------------------------------------
 // 7. SCRAPE A SINGLE SEARCH TERM
 // ---------------------------------------------------------------------------
@@ -432,6 +446,7 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
       locale: "en-US",
       ...(proxy ? { proxy } : {}),
     });
+    await blockHeavyAssets(context);
     page = await context.newPage();
     attachInterceptor(page);
 
@@ -792,6 +807,7 @@ async function main() {
       locale: "en-US",
       ...(enrichProxy ? { proxy: enrichProxy } : {}),
     });
+    await blockHeavyAssets(ctx);
     let doneN = 0;
     await pool(allLeads, 4, async (lead) => {
       const info = await enrichFromFanPage(ctx, lead.facebookProfile);
@@ -814,6 +830,7 @@ async function main() {
     console.log(`Classifying ${total} landing pages...`);
     const classifyProxy = pickProxy(cfg.proxies);
     const ctx = await browser.newContext(classifyProxy ? { proxy: classifyProxy } : {});
+    await blockHeavyAssets(ctx);
     let doneN = 0;
     await pool(allLeads, 5, async (lead) => {
       lead.pageType = await classifyLandingPage(ctx, lead.landingPage);
