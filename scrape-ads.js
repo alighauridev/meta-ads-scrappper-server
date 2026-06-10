@@ -415,13 +415,14 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   const results = new Map(); // key -> normalized lead (per-term dedup)
   const url = buildSearchUrl(term, cfg.country);
 
-  // Residential proxy IPs are flaky — some are too slow/dead to load Facebook
-  // (the page lands on chrome-error://). Each attempt builds a NEW context with
-  // a FRESH proxy from the pool (a different residential IP), so one bad IP no
-  // longer dooms the run. Use domcontentloaded (networkidle rarely settles
-  // through a slow proxy).
-  let context = null, page = null, loaded = false;
-  for (let attempt = 1; attempt <= 4 && !loaded; attempt++) {
+  // Residential proxy IPs are flaky: some fail to load the page (chrome-error://),
+  // others load the shell but are too throttled for the SPA to bootstrap and fire
+  // its search query (graphqlResponses stays 0). Each attempt builds a NEW context
+  // with a FRESH proxy from the pool, and we only accept it once the search has
+  // actually fired — otherwise we rotate to another IP. domcontentloaded (not
+  // networkidle) for the nav so a slow proxy doesn't fail the goto outright.
+  let context = null, page = null, ready = false;
+  for (let attempt = 1; attempt <= 5 && !ready; attempt++) {
     const proxy = pickProxy(cfg.proxies);
     context = await browser.newContext({
       userAgent:
@@ -433,28 +434,37 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     });
     page = await context.newPage();
     attachInterceptor(page);
+
+    let navOk = false;
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: cfg.navTimeoutMs });
-      if (!page.url().startsWith("chrome-error")) loaded = true;
-    } catch {
-      // timeout / proxy tunnel error — fall through to retry
+      navOk = !page.url().startsWith("chrome-error");
+    } catch { /* timeout / proxy tunnel error */ }
+
+    if (navOk) {
+      // Let the SPA download its JS and fire the search. Wait for the network to
+      // settle, then poll up to ~25s for the first GraphQL response to appear.
+      await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+      for (let i = 0; i < 25 && gqlResponses === 0; i++) await page.waitForTimeout(1000);
     }
-    if (!loaded) {
-      console.log(`  [${term}] page failed to load (attempt ${attempt}/4${proxy ? ` via ${proxy.server}` : ""}) — trying a fresh IP...`);
+
+    if (navOk && gqlResponses > 0) {
+      ready = true;
+    } else {
+      const why = !navOk ? "page failed to load" : "search never fired (IP throttled)";
+      console.log(`  [${term}] attempt ${attempt}/5: ${why}${proxy ? ` via ${proxy.server}` : ""} — trying a fresh IP...`);
       await context.close().catch(() => {});
       context = null;
       gqlResponses = 0; gqlWithAdData = 0; gqlReadErrors = 0; rawNodes.length = 0;
     }
   }
 
-  if (!loaded) {
-    console.log(`  [${term}] 0 leads — PAGE FAILED TO LOAD after 4 attempts (proxy IPs couldn't reach Facebook). Add more/fresher proxies.`);
+  if (!ready) {
+    console.log(`  [${term}] 0 leads — gave up after 5 attempts (proxy IPs couldn't load Facebook's search). Add more/fresher proxies.`);
     if (context) await context.close().catch(() => {});
     return [];
   }
-
-  // give the in-page search a moment to fire its GraphQL after DOM is ready
-  await page.waitForTimeout(3000).catch(() => {});
+  const loaded = true;
 
   // Best-effort: dismiss Facebook's cookie-consent dialog. If left open it can
   // block the search from ever firing its GraphQL calls (a common reason a
