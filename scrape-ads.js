@@ -373,14 +373,27 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   });
 
   const results = new Map(); // key -> normalized lead (per-term dedup)
-  try {
-    await page.goto(buildSearchUrl(term, cfg.country), {
-      waitUntil: "networkidle",
-      timeout: cfg.navTimeoutMs,
-    });
-  } catch {
-    // networkidle can time out on a busy page; we still have whatever loaded
+
+  // Residential proxy IPs are sometimes slow or dead and the page fails to load
+  // at all (lands on chrome-error://). Retry a few times — with a ROTATING proxy
+  // each attempt gets a fresh IP — before giving up. Use domcontentloaded (not
+  // networkidle, which rarely settles through a slow proxy).
+  const url = buildSearchUrl(term, cfg.country);
+  let loaded = false;
+  for (let attempt = 1; attempt <= 4 && !loaded; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: cfg.navTimeoutMs });
+      if (!page.url().startsWith("chrome-error")) loaded = true;
+    } catch {
+      // timeout / proxy tunnel error — fall through to retry
+    }
+    if (!loaded && attempt < 4) {
+      console.log(`  [${term}] page failed to load (attempt ${attempt}/4) — retrying with a fresh IP...`);
+      await page.waitForTimeout(2000);
+    }
   }
+  // give the in-page search a moment to fire its GraphQL after DOM is ready
+  if (loaded) await page.waitForTimeout(3000).catch(() => {});
 
   // Best-effort: dismiss Facebook's cookie-consent dialog. If left open it can
   // block the search from ever firing its GraphQL calls (a common reason a
@@ -431,6 +444,8 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     // NOTE: a bare "log in" link is ALWAYS in the Ads Library header — it is not
     // evidence of a wall. Only treat explicit "must log in" prompts as a wall.
     const signal =
+      finalUrl.startsWith("chrome-error") || !loaded
+        ? "PAGE FAILED TO LOAD via proxy (slow/dead residential IP) — retry or use a ROTATING proxy" :
       /you must log in|log in to continue|log in to see/.test(lc) ? "LOGIN REQUIRED (IP flagged)" :
       /allow.*cookies|cookies policy|accept cookies/.test(lc) ? "COOKIE CONSENT not dismissed" :
       /isn'?t available|not available|something went wrong|try again later/.test(lc) ? "BLOCKED / UNAVAILABLE" :
