@@ -338,62 +338,123 @@ function leadKey(lead) {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. PROXY POOL — residential IPs are flaky, so we rotate across a pool and
+// pick a fresh one per attempt. Sources (first non-empty wins):
+//   PROXY_LIST : newline/comma separated "host:port:user:pass" (or full URLs)
+//   PROXY_URL (+ PROXY_USERNAME/PROXY_PASSWORD) : a single proxy
+// ---------------------------------------------------------------------------
+function parseProxyLine(line) {
+  const s = (line || "").trim();
+  if (!s) return null;
+  if (/^\w+:\/\//.test(s)) {
+    try {
+      const u = new URL(s);
+      return {
+        server: `${u.protocol}//${u.host}`,
+        username: u.username ? decodeURIComponent(u.username) : undefined,
+        password: u.password ? decodeURIComponent(u.password) : undefined,
+      };
+    } catch { return null; }
+  }
+  const parts = s.split(":");
+  if (parts.length >= 4) {
+    const [host, port, user, ...rest] = parts;
+    return { server: `http://${host}:${port}`, username: user, password: rest.join(":") };
+  }
+  if (parts.length === 2) return { server: `http://${parts[0]}:${parts[1]}` };
+  return null;
+}
+
+function loadProxies() {
+  const out = [];
+  for (const line of (process.env.PROXY_LIST || "").split(/[\r\n,]+/)) {
+    const p = parseProxyLine(line);
+    if (p) out.push(p);
+  }
+  if (!out.length && process.env.PROXY_URL) {
+    out.push({
+      server: process.env.PROXY_URL,
+      username: process.env.PROXY_USERNAME || undefined,
+      password: process.env.PROXY_PASSWORD || undefined,
+    });
+  }
+  return out;
+}
+
+function pickProxy(proxies) {
+  if (!proxies || !proxies.length) return undefined;
+  return proxies[Math.floor(Math.random() * proxies.length)];
+}
+
+// ---------------------------------------------------------------------------
 // 7. SCRAPE A SINGLE SEARCH TERM
 // ---------------------------------------------------------------------------
 async function scrapeTerm(browser, term, cfg, seenKeys) {
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    viewport: { width: 1366, height: 900 },
-    locale: "en-US",
-  });
-  const page = await context.newPage();
-
   const rawNodes = [];
   let gqlResponses = 0;   // how many GraphQL responses we saw (diagnostic)
   let gqlWithAdData = 0;  // how many of them actually contained ad data
   let gqlReadErrors = 0;  // how many response bodies we failed to read
-  // Intercept every GraphQL response and pull ad nodes out of the JSON.
-  page.on("response", async (response) => {
-    const url = response.url();
-    if (!url.includes("/api/graphql") && !url.includes("/graphql")) return;
-    gqlResponses++;
-    if (response.status() !== 200) return;
-    try {
-      const text = await response.text();
-      if (text.includes("ad_archive_id") || text.includes("adArchiveID")) gqlWithAdData++;
-      for (const obj of parseGraphQLBody(text)) {
-        extractAdNodes(obj, rawNodes);
+
+  // Attach the GraphQL interceptor that pulls ad nodes out of each response.
+  const attachInterceptor = (pg) => {
+    pg.on("response", async (response) => {
+      const u = response.url();
+      if (!u.includes("/api/graphql") && !u.includes("/graphql")) return;
+      gqlResponses++;
+      if (response.status() !== 200) return;
+      try {
+        const text = await response.text();
+        if (text.includes("ad_archive_id") || text.includes("adArchiveID")) gqlWithAdData++;
+        for (const obj of parseGraphQLBody(text)) extractAdNodes(obj, rawNodes);
+      } catch {
+        gqlReadErrors++; // body already consumed / non-text
       }
-    } catch {
-      // body already consumed / non-text — ignore
-      gqlReadErrors++;
-    }
-  });
+    });
+  };
 
   const results = new Map(); // key -> normalized lead (per-term dedup)
-
-  // Residential proxy IPs are sometimes slow or dead and the page fails to load
-  // at all (lands on chrome-error://). Retry a few times — with a ROTATING proxy
-  // each attempt gets a fresh IP — before giving up. Use domcontentloaded (not
-  // networkidle, which rarely settles through a slow proxy).
   const url = buildSearchUrl(term, cfg.country);
-  let loaded = false;
+
+  // Residential proxy IPs are flaky — some are too slow/dead to load Facebook
+  // (the page lands on chrome-error://). Each attempt builds a NEW context with
+  // a FRESH proxy from the pool (a different residential IP), so one bad IP no
+  // longer dooms the run. Use domcontentloaded (networkidle rarely settles
+  // through a slow proxy).
+  let context = null, page = null, loaded = false;
   for (let attempt = 1; attempt <= 4 && !loaded; attempt++) {
+    const proxy = pickProxy(cfg.proxies);
+    context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      viewport: { width: 1366, height: 900 },
+      locale: "en-US",
+      ...(proxy ? { proxy } : {}),
+    });
+    page = await context.newPage();
+    attachInterceptor(page);
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: cfg.navTimeoutMs });
       if (!page.url().startsWith("chrome-error")) loaded = true;
     } catch {
       // timeout / proxy tunnel error — fall through to retry
     }
-    if (!loaded && attempt < 4) {
-      console.log(`  [${term}] page failed to load (attempt ${attempt}/4) — retrying with a fresh IP...`);
-      await page.waitForTimeout(2000);
+    if (!loaded) {
+      console.log(`  [${term}] page failed to load (attempt ${attempt}/4${proxy ? ` via ${proxy.server}` : ""}) — trying a fresh IP...`);
+      await context.close().catch(() => {});
+      context = null;
+      gqlResponses = 0; gqlWithAdData = 0; gqlReadErrors = 0; rawNodes.length = 0;
     }
   }
+
+  if (!loaded) {
+    console.log(`  [${term}] 0 leads — PAGE FAILED TO LOAD after 4 attempts (proxy IPs couldn't reach Facebook). Add more/fresher proxies.`);
+    if (context) await context.close().catch(() => {});
+    return [];
+  }
+
   // give the in-page search a moment to fire its GraphQL after DOM is ready
-  if (loaded) await page.waitForTimeout(3000).catch(() => {});
+  await page.waitForTimeout(3000).catch(() => {});
 
   // Best-effort: dismiss Facebook's cookie-consent dialog. If left open it can
   // block the search from ever firing its GraphQL calls (a common reason a
@@ -427,8 +488,13 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     }
     idleScrolls = results.size > before ? 0 : idleScrolls + 1;
 
-    // scroll to trigger the next GraphQL pagination batch
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    // scroll to trigger the next GraphQL pagination batch (guard against a
+    // not-yet-ready body, and never let a transient scroll error kill the run)
+    await page.evaluate(() => {
+      const h = (document.body && document.body.scrollHeight)
+        || document.documentElement.scrollHeight || 100000;
+      window.scrollTo(0, h);
+    }).catch(() => {});
     await page.waitForTimeout(cfg.scrollDelayMs);
   }
 
@@ -664,26 +730,22 @@ async function main() {
   console.log(`Scraping ${terms.length} term(s), target ${cfg.max} unique/term, ` +
     `concurrency ${cfg.concurrency}, dedup against ${seenKeys.size} existing.`);
 
-  // Optional residential proxy. Facebook suppresses Ads Library results for
-  // datacenter IPs (e.g. Render/AWS), so on a server you typically MUST route
-  // through a residential proxy. Set PROXY_URL (and PROXY_USERNAME/PASSWORD).
-  //   PROXY_URL=http://gw.example.com:7000
-  const proxy = process.env.PROXY_URL
-    ? {
-        server: process.env.PROXY_URL,
-        ...(process.env.PROXY_USERNAME
-          ? { username: process.env.PROXY_USERNAME, password: process.env.PROXY_PASSWORD }
-          : {}),
-      }
-    : undefined;
-  if (proxy) console.log(`Using proxy ${proxy.server}`);
+  // Residential proxy pool. Facebook suppresses Ads Library results for
+  // datacenter IPs (e.g. Render/AWS), so on a server you MUST route through
+  // residential IPs. We rotate across the pool and pick a fresh one per attempt.
+  cfg.proxies = loadProxies();
+  if (cfg.proxies.length) {
+    console.log(`Loaded ${cfg.proxies.length} proxy endpoint(s); rotating per attempt.`);
+  } else {
+    console.log("No proxy configured (set PROXY_LIST or PROXY_URL) — using the host IP directly.");
+  }
 
   // --no-sandbox is required when running as root inside a container (Render,
   // Docker, CI); Chromium otherwise refuses to launch. Harmless locally.
+  // NOTE: proxy is set per-context now (see scrapeTerm), not at launch.
   const browser = await chromium.launch({
     headless: cfg.headless,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    ...(proxy ? { proxy } : {}),
   });
 
   const perTerm = await pool(terms, cfg.concurrency, async (term) => {
@@ -712,11 +774,13 @@ async function main() {
   if (cfg.enrichPage) {
     const total = allLeads.length;
     console.log(`Enriching ${total} fan pages (website/phone/instagram)...`);
+    const enrichProxy = pickProxy(cfg.proxies);
     const ctx = await browser.newContext({
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       locale: "en-US",
+      ...(enrichProxy ? { proxy: enrichProxy } : {}),
     });
     let doneN = 0;
     await pool(allLeads, 4, async (lead) => {
@@ -738,7 +802,8 @@ async function main() {
   if (cfg.classify) {
     const total = allLeads.length;
     console.log(`Classifying ${total} landing pages...`);
-    const ctx = await browser.newContext();
+    const classifyProxy = pickProxy(cfg.proxies);
+    const ctx = await browser.newContext(classifyProxy ? { proxy: classifyProxy } : {});
     let doneN = 0;
     await pool(allLeads, 5, async (lead) => {
       lead.pageType = await classifyLandingPage(ctx, lead.landingPage);
