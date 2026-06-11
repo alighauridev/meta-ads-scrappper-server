@@ -56,7 +56,7 @@ function runScrape({ term, max, country, enrichPage, classify }, outPath, tag = 
     "--terms", term,
     "--max", String(max || 50),
     "--country", country || "US",
-    "--idle", "12",
+    "--idle", "25",
     "--out", outPath,
   ];
   if (enrichPage) args.push("--enrich-page");
