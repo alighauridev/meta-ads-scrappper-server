@@ -33,7 +33,7 @@ import { writeFile, readFile } from "node:fs/promises";
 const DEFAULTS = {
   country: "US",
   max: 50,            // target unique leads PER search term
-  concurrency: 2,     // how many search terms to scrape in parallel
+  concurrency: 1,     // one term at a time — prevents OOM on 2GB server
   classify: false,    // fetch landing pages and tag opt-in / vsl / booking
   headless: true,
   out: "leads.json",
