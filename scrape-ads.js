@@ -41,6 +41,15 @@ const DEFAULTS = {
   maxIdleScrolls: 4,
   scrollDelayMs: 1800, // give GraphQL pagination time to fire + return
   navTimeoutMs: 60000,
+  // How many fresh proxy IPs to try before giving up on a term. Residential
+  // pools have many flagged IPs at any moment; with a 97-IP pool, burning
+  // through more of them dramatically raises the odds of hitting one Facebook
+  // will actually serve the search to.
+  maxAttempts: parseInt(process.env.SCRAPE_MAX_ATTEMPTS || "12", 10),
+  // Seconds to wait for the search GraphQL to fire on a loaded page before
+  // declaring the IP throttled and rotating. Slow residential IPs sometimes
+  // fire the search late, so give them room.
+  gqlWaitSec: parseInt(process.env.SCRAPE_GQL_WAIT_SEC || "20", 10),
 };
 
 // ---------------------------------------------------------------------------
@@ -185,6 +194,18 @@ function getAdCopy(snap) {
   return null;
 }
 
+// Return the first usable text among the candidates (template tokens stripped),
+// capped. Used to surface the headline and link-description on their own —
+// the search term often lives there (the bold title / the line by the button)
+// rather than in the body copy.
+function firstUsable(cands, cap = 300) {
+  for (const cand of cands) {
+    const ok = usableText(cand);
+    if (ok) return ok.slice(0, cap);
+  }
+  return null;
+}
+
 // 5a-iii. LANDING PAGE — reach into cards[] for carousel ads, and recognise
 // Facebook-internal destinations. Lead-form / Messenger / video-view ads have
 // NO external landing page; Facebook returns a bare "fb.me" or nothing. We flag
@@ -293,6 +314,16 @@ function normalizeAd(node) {
 
   const adCopy = getAdCopy(snap);
 
+  // Headline + the description line next to the CTA button. These often contain
+  // the search term even when the body copy doesn't. Fall back to the first
+  // card's fields for carousel/multi-card ads.
+  const cards = Array.isArray(snap.cards) ? snap.cards : [];
+  const adTitle = firstUsable([snap.title, ...cards.map((c) => c.title)]);
+  const adLinkDescription = firstUsable([
+    snap.link_description,
+    ...cards.map((c) => c.link_description),
+  ]);
+
   const creative = getAdCreative(snap, adArchiveId);
 
   // node-level collation count if Facebook provides it (how many ads collated
@@ -313,6 +344,8 @@ function normalizeAd(node) {
     landingPage: lp.url,                          // null for lead-form/messenger/video ads
     destinationType: lp.type,                     // external | facebook_lead_form | messenger | instagram | none
     adCopySnippet: adCopy,
+    adTitle,                                      // bold headline by the creative
+    adLinkDescription,                            // line next to the CTA button
     activeAdCount: collationCount,              // refined after grouping in main()
     // --- from / about the FAN PAGE ---
     facebookProfile: pageId ? `https://www.facebook.com/${pageId}` : null,
@@ -462,7 +495,8 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   // networkidle) for the nav so a slow proxy doesn't fail the goto outright.
   let context = null, page = null, ready = false;
   const tried = new Set();
-  for (let attempt = 1; attempt <= 5 && !ready; attempt++) {
+  const maxAttempts = cfg.maxAttempts || 12;
+  for (let attempt = 1; attempt <= maxAttempts && !ready; attempt++) {
     const proxy = pickProxy(cfg.proxies, tried);
     if (proxy) tried.add(proxyKey(proxy));
     context = await browser.newContext({
@@ -484,17 +518,20 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     } catch { /* timeout / proxy tunnel error */ }
 
     if (navOk) {
-      // Let the SPA download its JS and fire the search. Wait for the network to
-      // settle, then poll up to ~25s for the first GraphQL response to appear.
-      await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-      for (let i = 0; i < 25 && gqlResponses === 0; i++) await page.waitForTimeout(1000);
+      // Give the SPA a brief moment to boot its JS, then poll for the search
+      // GraphQL. The interceptor records responses the instant they arrive, so we
+      // catch a good IP as soon as it fires instead of blocking on networkidle
+      // (which Facebook's long-polling rarely reaches anyway).
+      await page.waitForTimeout(3000);
+      const waitSec = cfg.gqlWaitSec || 30;
+      for (let i = 0; i < waitSec && gqlResponses === 0; i++) await page.waitForTimeout(1000);
     }
 
     if (navOk && gqlResponses > 0) {
       ready = true;
     } else {
       const why = !navOk ? "page failed to load" : "search never fired (IP throttled)";
-      console.log(`  [${term}] attempt ${attempt}/5: ${why}${proxy ? ` via ${proxy.server}` : ""} — trying a fresh IP...`);
+      console.log(`  [${term}] attempt ${attempt}/${maxAttempts}: ${why}${proxy ? ` via ${proxy.server}` : ""} — trying a fresh IP...`);
       await context.close().catch(() => {});
       context = null;
       gqlResponses = 0; gqlWithAdData = 0; gqlReadErrors = 0; rawNodes.length = 0;
@@ -502,7 +539,7 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   }
 
   if (!ready) {
-    console.log(`  [${term}] 0 leads — gave up after 5 attempts (proxy IPs couldn't load Facebook's search). Add more/fresher proxies.`);
+    console.log(`  [${term}] 0 leads — gave up after ${maxAttempts} attempts (proxy IPs couldn't load Facebook's search). Add more/fresher proxies.`);
     if (context) await context.close().catch(() => {});
     return [];
   }
@@ -731,6 +768,8 @@ function parseArgs(argv) {
       case "--country": args.country = next(); break;
       case "--max": args.max = parseInt(next(), 10); break;
       case "--idle": args.maxIdleScrolls = parseInt(next(), 10); break;
+      case "--attempts": args.maxAttempts = parseInt(next(), 10); break;
+      case "--gql-wait": args.gqlWaitSec = parseInt(next(), 10); break;
       case "--concurrency": args.concurrency = parseInt(next(), 10); break;
       case "--out": args.out = next(); break;
       case "--existing": args.existing = next(); break;
