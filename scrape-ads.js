@@ -47,12 +47,19 @@ const DEFAULTS = {
 // 2. URL BUILDER
 // ---------------------------------------------------------------------------
 function buildSearchUrl(term, country) {
+  // A term wrapped in quotes — "strategy session" or 'book a call' — is treated as
+  // an EXACT PHRASE: Meta only returns ads where those words appear together, in
+  // that order. Without quotes we use keyword_unordered, where Meta matches each
+  // word independently (any order, stemmed, across copy/page name/caption/landing),
+  // which is why a bare multi-word term pulls ads that don't contain the phrase.
+  const quoted = /^"(.+)"$/.test(term) || /^'(.+)'$/.test(term);
+  const q = quoted ? term.slice(1, -1).trim() : term;
   const params = new URLSearchParams({
     active_status: "all",
     ad_type: "all",
     country,
-    q: term,
-    search_type: "keyword_unordered",
+    q,
+    search_type: quoted ? "keyword_exact_phrase" : "keyword_unordered",
     media_type: "all",
   });
   return `https://www.facebook.com/ads/library/?${params.toString()}`;
