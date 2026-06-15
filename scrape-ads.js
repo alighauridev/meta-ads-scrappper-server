@@ -97,10 +97,14 @@ function requiredTokens(term) {
 function parseTerm(term) {
   const t = term.trim();
 
-  // Fully-quoted -> exact phrase, exactly like Meta's "Search this exact phrase".
-  // Meta guarantees the phrase is present, so no extra filtering needed.
+  // Fully-quoted -> exact phrase, like Meta's "Search this exact phrase". We STILL
+  // post-filter: Meta's exact-phrase match also hits hidden fields (e.g. the
+  // landing page), so it can return ads where the phrase isn't in the visible ad.
+  // The client's main complaint was exactly that — so we verify the phrase really
+  // appears in the ad text.
   if (isQuoted(t)) {
-    return { metaQuery: t.slice(1, -1).trim(), searchType: "keyword_exact_phrase", required: [] };
+    const phrase = t.slice(1, -1).trim();
+    return { metaQuery: phrase, searchType: "keyword_exact_phrase", required: [phrase.toLowerCase()] };
   }
 
   // Otherwise: send the words to Meta to narrow the crawl, then keep only ads
