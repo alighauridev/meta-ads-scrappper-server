@@ -55,19 +55,18 @@ const DEFAULTS = {
 // ---------------------------------------------------------------------------
 // 2. SEARCH-TERM GRAMMAR  +  URL BUILDER
 // ---------------------------------------------------------------------------
-// One search term from the box can be:
-//   tax                         -> broad keyword (Meta matches the word, loosely)
-//   "strategy session"          -> EXACT PHRASE (words together, in order)
-//   tax AND "strategy session"  -> BOOLEAN AND: ads containing BOTH
+// The scraper mirrors the Meta Ads Library exactly — we send the query the way
+// Meta interprets it and return what Meta returns (no extra filtering on our
+// side). One search term from the box can be:
+//   CPA                  -> keyword search (Meta matches loosely across copy,
+//                           page name, caption, landing page)
+//   CPA book a call      -> Meta requires all the words present (its native
+//                           loose AND), same as typing it into the Ads Library
+//   CPA AND book a call  -> identical to above; "AND"/"&&" is just a readable
+//                           separator we strip before sending to Meta
+//   "book a call"        -> EXACT PHRASE (Meta's "Search this exact phrase")
 // Commas separate independent searches (OR / union) and are split earlier, so a
-// single `term` here is one search. `AND` (case-insensitive) or `&&` joins
-// operands; each operand may be a quoted phrase.
-//
-// Meta itself can't do "word AND exact-phrase" in one query, and its matching is
-// fuzzy + searches non-copy fields. So for an AND term we (1) send all operand
-// words to Meta as keyword_unordered to narrow the crawl, then (2) keep only ads
-// whose text actually contains EVERY operand. That makes the AND reliable and
-// honors exact phrases — driven entirely from the search box.
+// single `term` here is one Meta search.
 function isQuoted(s) {
   const t = s.trim();
   return /^".+"$/.test(t) || /^'.+'$/.test(t);
@@ -77,60 +76,25 @@ function stripQuotes(s) {
   return isQuoted(t) ? t.slice(1, -1).trim() : t;
 }
 
-// Turn one AND operand into the tokens that must ALL be present in an ad:
-//   "book a call"  (quoted)   -> ["book a call"]   exact contiguous phrase
-//   book a call    (unquoted) -> ["book", "call"]  each word, anywhere
-//   CPA            (one word) -> ["cpa"]
-// This is what fixes recall: an unquoted multi-word operand should NOT require
-// the words to be glued together — "Book Now… schedule a call" should match.
-function operandTokens(operand) {
-  const t = operand.trim();
-  if (isQuoted(t)) return [t.slice(1, -1).trim().toLowerCase()];
-  const words = t.toLowerCase().split(/\s+/).filter((w) => w.length >= 2); // drop "a", "i"
-  return words.length ? words : [t.toLowerCase()];
-}
-
 function parseTerm(term) {
-  const operands = term
-    .split(/\s+AND\s+|\s*&&\s*/i)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const t = term.trim();
 
-  if (operands.length > 1) {
-    // Boolean AND. `required` is a list of operand groups; an ad must satisfy
-    // EVERY group, and every token within a group.
-    return {
-      metaQuery: operands.map(stripQuotes).join(" "), // all words -> Meta narrows
-      searchType: "keyword_unordered",
-      required: operands.map(operandTokens),
-    };
+  // Fully-quoted -> exact phrase, exactly like Meta's "Search this exact phrase".
+  if (isQuoted(t)) {
+    return { metaQuery: t.slice(1, -1).trim(), searchType: "keyword_exact_phrase" };
   }
 
-  // Single operand: quoted -> exact phrase, else broad keyword.
-  const quoted = isQuoted(term);
-  return {
-    metaQuery: quoted ? term.slice(1, -1).trim() : term,
-    searchType: quoted ? "keyword_exact_phrase" : "keyword_unordered",
-    required: [],
-  };
-}
-
-// The text on a lead we check an AND operand against — headline, the line by the
-// button, body copy, company name, the CTA button label, and the URLs.
-function leadSearchText(lead) {
-  return [
-    lead.companyName, lead.adTitle, lead.adLinkDescription, lead.adCopySnippet,
-    lead.cta, lead.website, lead.landingPage, lead.displayUrl,
-  ]
-    .map((v) => (v == null ? "" : String(v)))
-    .join("  ")
-    .toLowerCase();
-}
-
-// An ad passes the AND filter when every operand group is satisfied (every token
-// in the group present somewhere in the ad text).
-function matchesRequired(required, text) {
-  return required.every((group) => group.every((tok) => text.includes(tok)));
+  // Otherwise mirror Meta: drop any "AND"/"&&" separators and stray quotes and
+  // send the words as a loose keyword search. Meta itself requires every word to
+  // be present (matched loosely across the ad copy, page name, caption, and
+  // landing page) — we don't add any filtering on top.
+  const metaQuery = t
+    .split(/\s+AND\s+|\s*&&\s*/i)
+    .map(stripQuotes)
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  return { metaQuery: metaQuery || t, searchType: "keyword_unordered" };
 }
 
 function buildSearchUrl(parsed, country) {
@@ -558,9 +522,8 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   const results = new Map(); // key -> normalized lead (per-term dedup)
   const parsed = parseTerm(term);
   const url = buildSearchUrl(parsed, cfg.country);
-  if (parsed.required.length) {
-    const desc = parsed.required.map((g) => (g.length > 1 ? `(${g.join("+")})` : g[0])).join(" AND ");
-    console.log(`  [${term}] Boolean AND → Meta q="${parsed.metaQuery}", require: ${desc}`);
+  if (parsed.metaQuery !== term.trim()) {
+    console.log(`  [${term}] → Meta q="${parsed.metaQuery}" (${parsed.searchType})`);
   }
 
   // Residential proxy IPs are flaky: some fail to load the page (chrome-error://),
@@ -635,18 +598,12 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   } catch { /* no dialog */ }
 
   let idleScrolls = 0;
-  // AND filtering rejects most ads, so scroll deeper before giving up.
-  const idleLimit = parsed.required.length ? cfg.maxIdleScrolls * 3 : cfg.maxIdleScrolls;
-  while (results.size < cfg.max && idleScrolls < idleLimit) {
+  while (results.size < cfg.max && idleScrolls < cfg.maxIdleScrolls) {
     // fold whatever we've intercepted so far into results
     const before = results.size;
     for (const node of rawNodes.splice(0)) {
       const lead = normalizeAd(node);
       if (!lead.adArchiveId) continue;
-      // Boolean AND: keep only ads whose text satisfies every operand.
-      if (parsed.required.length) {
-        if (!matchesRequired(parsed.required, leadSearchText(lead))) continue;
-      }
       const key = leadKey(lead);
       if (results.has(key)) continue;       // duplicate within this term
       if (seenKeys.has(key)) continue;       // already seen globally / existing
