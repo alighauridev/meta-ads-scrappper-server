@@ -71,30 +71,66 @@ function isQuoted(s) {
   const t = s.trim();
   return /^".+"$/.test(t) || /^'.+'$/.test(t);
 }
-function stripQuotes(s) {
-  const t = s.trim();
-  return isQuoted(t) ? t.slice(1, -1).trim() : t;
+
+// Break a term into the substrings that must ALL appear in the ad:
+//   "book a call" (quoted)   -> one token  "book a call"  (exact phrase)
+//   book a call / book AND call -> tokens  "book", "call" (each word, anywhere)
+//   CPA                      -> "cpa"
+// "AND"/"&&" are treated as separators; tiny words ("a", "i") are dropped.
+function requiredTokens(term) {
+  const tokens = [];
+  const re = /"([^"]+)"|'([^']+)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(term)) !== null) {
+    const phrase = m[1] || m[2];
+    if (phrase) {
+      tokens.push(phrase.trim().toLowerCase());
+    } else {
+      const w = m[3].toLowerCase();
+      if (/^(and|&&)$/.test(w)) continue;     // operator, skip
+      if (w.length >= 2) tokens.push(w);        // drop "a", "i"
+    }
+  }
+  return tokens;
 }
 
 function parseTerm(term) {
   const t = term.trim();
 
   // Fully-quoted -> exact phrase, exactly like Meta's "Search this exact phrase".
+  // Meta guarantees the phrase is present, so no extra filtering needed.
   if (isQuoted(t)) {
-    return { metaQuery: t.slice(1, -1).trim(), searchType: "keyword_exact_phrase" };
+    return { metaQuery: t.slice(1, -1).trim(), searchType: "keyword_exact_phrase", required: [] };
   }
 
-  // Otherwise mirror Meta: drop any "AND"/"&&" separators and stray quotes and
-  // send the words as a loose keyword search. Meta itself requires every word to
-  // be present (matched loosely across the ad copy, page name, caption, and
-  // landing page) — we don't add any filtering on top.
+  // Otherwise: send the words to Meta to narrow the crawl, then keep only ads
+  // whose text actually CONTAINS every word/phrase. This is the client's core
+  // requirement — the search term must really appear in the ad, not just be a
+  // loose Meta match across hidden fields. Spaces = implicit AND.
   const metaQuery = t
-    .split(/\s+AND\s+|\s*&&\s*/i)
-    .map(stripQuotes)
-    .filter(Boolean)
-    .join(" ")
+    .replace(/["']/g, " ")
+    .replace(/\s+AND\s+/gi, " ")
+    .replace(/&&/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
-  return { metaQuery: metaQuery || t, searchType: "keyword_unordered" };
+  return { metaQuery: metaQuery || t, searchType: "keyword_unordered", required: requiredTokens(t) };
+}
+
+// The ad text we check the required tokens against — company, headline, the line
+// by the button, body copy, CTA button label, and the URLs.
+function leadSearchText(lead) {
+  return [
+    lead.companyName, lead.adTitle, lead.adLinkDescription, lead.adCopySnippet,
+    lead.cta, lead.website, lead.landingPage, lead.displayUrl,
+  ]
+    .map((v) => (v == null ? "" : String(v)))
+    .join("  ")
+    .toLowerCase();
+}
+
+// An ad passes when every required token is present somewhere in its text.
+function matchesRequired(required, text) {
+  return required.every((tok) => text.includes(tok));
 }
 
 function buildSearchUrl(parsed, country) {
@@ -522,7 +558,9 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   const results = new Map(); // key -> normalized lead (per-term dedup)
   const parsed = parseTerm(term);
   const url = buildSearchUrl(parsed, cfg.country);
-  if (parsed.metaQuery !== term.trim()) {
+  if (parsed.required.length) {
+    console.log(`  [${term}] → Meta q="${parsed.metaQuery}", keep only ads containing: ${parsed.required.map((r) => `"${r}"`).join(" + ")}`);
+  } else if (parsed.metaQuery !== term.trim()) {
     console.log(`  [${term}] → Meta q="${parsed.metaQuery}" (${parsed.searchType})`);
   }
 
@@ -598,12 +636,16 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   } catch { /* no dialog */ }
 
   let idleScrolls = 0;
-  while (results.size < cfg.max && idleScrolls < cfg.maxIdleScrolls) {
+  // Filtering rejects many ads, so scroll deeper before giving up on a term.
+  const idleLimit = parsed.required.length ? cfg.maxIdleScrolls * 3 : cfg.maxIdleScrolls;
+  while (results.size < cfg.max && idleScrolls < idleLimit) {
     // fold whatever we've intercepted so far into results
     const before = results.size;
     for (const node of rawNodes.splice(0)) {
       const lead = normalizeAd(node);
       if (!lead.adArchiveId) continue;
+      // keep only ads whose text actually contains the searched keyword(s)
+      if (parsed.required.length && !matchesRequired(parsed.required, leadSearchText(lead))) continue;
       const key = leadKey(lead);
       if (results.has(key)) continue;       // duplicate within this term
       if (seenKeys.has(key)) continue;       // already seen globally / existing
