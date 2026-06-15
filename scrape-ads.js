@@ -68,9 +68,26 @@ const DEFAULTS = {
 // words to Meta as keyword_unordered to narrow the crawl, then (2) keep only ads
 // whose text actually contains EVERY operand. That makes the AND reliable and
 // honors exact phrases — driven entirely from the search box.
+function isQuoted(s) {
+  const t = s.trim();
+  return /^".+"$/.test(t) || /^'.+'$/.test(t);
+}
 function stripQuotes(s) {
   const t = s.trim();
-  return (/^".+"$/.test(t) || /^'.+'$/.test(t)) ? t.slice(1, -1).trim() : t;
+  return isQuoted(t) ? t.slice(1, -1).trim() : t;
+}
+
+// Turn one AND operand into the tokens that must ALL be present in an ad:
+//   "book a call"  (quoted)   -> ["book a call"]   exact contiguous phrase
+//   book a call    (unquoted) -> ["book", "call"]  each word, anywhere
+//   CPA            (one word) -> ["cpa"]
+// This is what fixes recall: an unquoted multi-word operand should NOT require
+// the words to be glued together — "Book Now… schedule a call" should match.
+function operandTokens(operand) {
+  const t = operand.trim();
+  if (isQuoted(t)) return [t.slice(1, -1).trim().toLowerCase()];
+  const words = t.toLowerCase().split(/\s+/).filter((w) => w.length >= 2); // drop "a", "i"
+  return words.length ? words : [t.toLowerCase()];
 }
 
 function parseTerm(term) {
@@ -80,17 +97,17 @@ function parseTerm(term) {
     .filter(Boolean);
 
   if (operands.length > 1) {
-    // Boolean AND
-    const phrases = operands.map(stripQuotes);
+    // Boolean AND. `required` is a list of operand groups; an ad must satisfy
+    // EVERY group, and every token within a group.
     return {
-      metaQuery: phrases.join(" "),       // all words -> Meta narrows (unordered)
+      metaQuery: operands.map(stripQuotes).join(" "), // all words -> Meta narrows
       searchType: "keyword_unordered",
-      required: phrases.map((p) => p.toLowerCase()), // each must appear in the ad
+      required: operands.map(operandTokens),
     };
   }
 
   // Single operand: quoted -> exact phrase, else broad keyword.
-  const quoted = /^"(.+)"$/.test(term) || /^'(.+)'$/.test(term);
+  const quoted = isQuoted(term);
   return {
     metaQuery: quoted ? term.slice(1, -1).trim() : term,
     searchType: quoted ? "keyword_exact_phrase" : "keyword_unordered",
@@ -99,15 +116,21 @@ function parseTerm(term) {
 }
 
 // The text on a lead we check an AND operand against — headline, the line by the
-// button, body copy, company name, and the URLs.
+// button, body copy, company name, the CTA button label, and the URLs.
 function leadSearchText(lead) {
   return [
     lead.companyName, lead.adTitle, lead.adLinkDescription, lead.adCopySnippet,
-    lead.website, lead.landingPage, lead.displayUrl,
+    lead.cta, lead.website, lead.landingPage, lead.displayUrl,
   ]
     .map((v) => (v == null ? "" : String(v)))
     .join("  ")
     .toLowerCase();
+}
+
+// An ad passes the AND filter when every operand group is satisfied (every token
+// in the group present somewhere in the ad text).
+function matchesRequired(required, text) {
+  return required.every((group) => group.every((tok) => text.includes(tok)));
 }
 
 function buildSearchUrl(parsed, country) {
@@ -536,7 +559,8 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
   const parsed = parseTerm(term);
   const url = buildSearchUrl(parsed, cfg.country);
   if (parsed.required.length) {
-    console.log(`  [${term}] Boolean AND → Meta q="${parsed.metaQuery}", require all of: ${parsed.required.map((r) => `"${r}"`).join(", ")}`);
+    const desc = parsed.required.map((g) => (g.length > 1 ? `(${g.join("+")})` : g[0])).join(" AND ");
+    console.log(`  [${term}] Boolean AND → Meta q="${parsed.metaQuery}", require: ${desc}`);
   }
 
   // Residential proxy IPs are flaky: some fail to load the page (chrome-error://),
@@ -619,10 +643,9 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     for (const node of rawNodes.splice(0)) {
       const lead = normalizeAd(node);
       if (!lead.adArchiveId) continue;
-      // Boolean AND: keep only ads whose text contains EVERY operand.
+      // Boolean AND: keep only ads whose text satisfies every operand.
       if (parsed.required.length) {
-        const text = leadSearchText(lead);
-        if (!parsed.required.every((r) => text.includes(r))) continue;
+        if (!matchesRequired(parsed.required, leadSearchText(lead))) continue;
       }
       const key = leadKey(lead);
       if (results.has(key)) continue;       // duplicate within this term
