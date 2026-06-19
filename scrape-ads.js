@@ -52,6 +52,12 @@ const DEFAULTS = {
   // declaring the IP throttled and rotating. Slow residential IPs sometimes
   // fire the search late, so give them room.
   gqlWaitSec: parseInt(process.env.SCRAPE_GQL_WAIT_SEC || "20", 10),
+  // A single "all" pass is best on one IP — splitting into image/video/meme runs
+  // 3 sessions that get progressively throttled and dedupe to the same companies,
+  // yielding FEWER results. Media-split only helps with strong rotating proxies
+  // (each pass on a fresh IP). Override with --media "image,video,meme" to try it.
+  mediaTypes: (process.env.SCRAPE_MEDIA_TYPES || "all")
+    .split(",").map((s) => s.trim()).filter(Boolean),
 };
 
 // ---------------------------------------------------------------------------
@@ -141,14 +147,14 @@ function matchesRequired(required, text) {
   return required.every((tok) => text.includes(tok));
 }
 
-function buildSearchUrl(parsed, country) {
+function buildSearchUrl(parsed, country, mediaType = "all") {
   const params = new URLSearchParams({
     active_status: "all",
     ad_type: "all",
     country,
     q: parsed.metaQuery,
     search_type: parsed.searchType,
-    media_type: "all",
+    media_type: mediaType,
   });
   return `https://www.facebook.com/ads/library/?${params.toString()}`;
 }
@@ -563,174 +569,133 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     });
   };
 
-  const results = new Map(); // key -> normalized lead (per-term dedup)
+  const results = new Map(); // key -> normalized lead (per-term dedup, across passes)
+  const seenArchive = new Set(); // every raw ad id seen across all passes (dedup + scan count)
   const parsed = parseTerm(term);
-  const url = buildSearchUrl(parsed, cfg.country);
   if (parsed.required.length) {
     console.log(`  [${term}] → Meta q="${parsed.metaQuery}", keep only ads containing: ${parsed.required.map((r) => `"${r}"`).join(" + ")}`);
   } else if (parsed.metaQuery !== term.trim()) {
     console.log(`  [${term}] → Meta q="${parsed.metaQuery}" (${parsed.searchType})`);
   }
 
-  // Residential proxy IPs are flaky: some fail to load the page (chrome-error://),
-  // others load the shell but are too throttled for the SPA to bootstrap and fire
-  // its search query (graphqlResponses stays 0). Each attempt builds a NEW context
-  // with a FRESH proxy from the pool, and we only accept it once the search has
-  // actually fired — otherwise we rotate to another IP. domcontentloaded (not
-  // networkidle) for the nav so a slow proxy doesn't fail the goto outright.
-  let context = null, page = null, ready = false;
-  const tried = new Set();
-  const maxAttempts = cfg.maxAttempts || 12;
-  for (let attempt = 1; attempt <= maxAttempts && !ready; attempt++) {
-    const proxy = pickProxy(cfg.proxies, tried);
-    if (proxy) tried.add(proxyKey(proxy));
-    context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      viewport: { width: 1366, height: 900 },
-      locale: "en-US",
-      ...(proxy ? { proxy } : {}),
-    });
-    await blockHeavyAssets(context);
-    page = await context.newPage();
-    attachInterceptor(page);
+  // One pass per media type. Meta caps each stream at ~1,000 ads; image/video/meme
+  // are separate streams, so passing each and merging breaks the single-pass cap.
+  const mediaTypes = (cfg.mediaTypes && cfg.mediaTypes.length) ? cfg.mediaTypes : ["all"];
 
-    let navOk = false;
-    try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: cfg.navTimeoutMs });
-      navOk = !page.url().startsWith("chrome-error");
-    } catch { /* timeout / proxy tunnel error */ }
+  // Acquire a ready (search-fired) context for one media-type URL, then scroll it
+  // to exhaustion, merging new advertisers into the shared `results`.
+  async function runPass(mediaType) {
+    const url = buildSearchUrl(parsed, cfg.country, mediaType);
+    // reset per-pass capture state
+    rawNodes.length = 0; gqlResponses = 0; gqlWithAdData = 0; gqlReadErrors = 0;
 
-    if (navOk) {
-      // Give the SPA a brief moment to boot its JS, then poll for the search
-      // GraphQL. The interceptor records responses the instant they arrive, so we
-      // catch a good IP as soon as it fires instead of blocking on networkidle
-      // (which Facebook's long-polling rarely reaches anyway).
-      await page.waitForTimeout(3000);
-      const waitSec = cfg.gqlWaitSec || 30;
-      for (let i = 0; i < waitSec && gqlResponses === 0; i++) await page.waitForTimeout(1000);
-    }
+    let context = null, page = null, ready = false;
+    const tried = new Set();
+    const maxAttempts = cfg.maxAttempts || 12;
+    for (let attempt = 1; attempt <= maxAttempts && !ready; attempt++) {
+      const proxy = pickProxy(cfg.proxies, tried);
+      if (proxy) tried.add(proxyKey(proxy));
+      context = await browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        viewport: { width: 1366, height: 900 },
+        locale: "en-US",
+        ...(proxy ? { proxy } : {}),
+      });
+      await blockHeavyAssets(context);
+      page = await context.newPage();
+      attachInterceptor(page);
 
-    if (navOk && gqlResponses > 0) {
-      ready = true;
-    } else {
-      const why = !navOk ? "page failed to load" : "search never fired (IP throttled)";
-      console.log(`  [${term}] attempt ${attempt}/${maxAttempts}: ${why}${proxy ? ` via ${proxy.server}` : ""} — trying a fresh IP...`);
-      await context.close().catch(() => {});
-      context = null;
-      gqlResponses = 0; gqlWithAdData = 0; gqlReadErrors = 0; rawNodes.length = 0;
-    }
-  }
+      let navOk = false;
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: cfg.navTimeoutMs });
+        navOk = !page.url().startsWith("chrome-error");
+      } catch { /* timeout / proxy tunnel error */ }
 
-  if (!ready) {
-    console.log(`  [${term}] 0 leads — gave up after ${maxAttempts} attempts (proxy IPs couldn't load Facebook's search). Add more/fresher proxies.`);
-    if (context) await context.close().catch(() => {});
-    return [];
-  }
-  const loaded = true;
-
-  // Best-effort: dismiss Facebook's cookie-consent dialog. If left open it can
-  // block the search from ever firing its GraphQL calls (a common reason a
-  // fresh/datacenter session returns 0 results).
-  try {
-    const consent = page.getByRole("button", {
-      name: /allow all cookies|accept all|allow essential|only allow essential|accept/i,
-    });
-    if (await consent.first().isVisible({ timeout: 3000 }).catch(() => false)) {
-      await consent.first().click({ timeout: 3000 }).catch(() => {});
-      await page.waitForTimeout(1500);
-    }
-  } catch { /* no dialog */ }
-
-  // Keep scrolling as long as Meta keeps serving NEW ads. The stop condition is
-  // "Meta served no new ad for N scrolls" (its stream is exhausted) — NOT "no new
-  // lead passed the filter". Otherwise a filtered search quits while Meta still
-  // has thousands more ads to page through.
-  const seenArchive = new Set();   // every raw ad id we've seen (matched or not)
-  let idleScrolls = 0;
-  const idleLimit = cfg.maxIdleScrolls;
-  while (results.size < cfg.max && idleScrolls < idleLimit) {
-    let newRaw = 0;
-    for (const node of rawNodes.splice(0)) {
-      const lead = normalizeAd(node);
-      if (!lead.adArchiveId) continue;
-      if (!seenArchive.has(lead.adArchiveId)) { seenArchive.add(lead.adArchiveId); newRaw++; }
-      // keep only ads whose text actually contains the searched keyword(s)
-      if (parsed.required.length && !matchesRequired(parsed.required, leadSearchText(lead))) continue;
-      const key = leadKey(lead);
-      if (results.has(key)) continue;       // duplicate advertiser within this term
-      if (seenKeys.has(key)) continue;       // already seen globally / existing
-      results.set(key, lead);
-      console.log(
-        `  + [${term}] #${results.size} ${lead.companyName || "?"}` +
-        ` | ${lead.website || lead.landingPage || lead.displayUrl || "no site"}`,
-      );
-    }
-    // idle only when Meta gave us nothing new this round (stream exhausted)
-    idleScrolls = newRaw > 0 ? 0 : idleScrolls + 1;
-
-    // Incremental scrolls reliably trigger Meta's infinite-scroll pagination —
-    // a single jump to the bottom sometimes loads only one batch.
-    await page.evaluate(async () => {
-      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      for (let i = 0; i < 4; i++) {
-        const h = (document.body && document.body.scrollHeight)
-          || document.documentElement.scrollHeight || 100000;
-        window.scrollTo(0, h);
-        await sleep(400);
+      if (navOk) {
+        await page.waitForTimeout(3000);
+        const waitSec = cfg.gqlWaitSec || 30;
+        for (let i = 0; i < waitSec && gqlResponses === 0; i++) await page.waitForTimeout(1000);
       }
-    }).catch(() => {});
-    await page.waitForTimeout(cfg.scrollDelayMs);
+
+      if (navOk && gqlResponses > 0) {
+        ready = true;
+      } else {
+        const why = !navOk ? "page failed to load" : "search never fired (IP throttled)";
+        console.log(`  [${term}] (${mediaType}) attempt ${attempt}/${maxAttempts}: ${why}${proxy ? ` via ${proxy.server}` : ""} — trying a fresh IP...`);
+        await context.close().catch(() => {});
+        context = null;
+        gqlResponses = 0; gqlWithAdData = 0; gqlReadErrors = 0; rawNodes.length = 0;
+      }
+    }
+
+    if (!ready) {
+      console.log(`  [${term}] (${mediaType}) gave up after ${maxAttempts} attempts (proxy IPs couldn't load the search).`);
+      if (context) await context.close().catch(() => {});
+      return;
+    }
+
+    // dismiss cookie-consent if present (can block the search firing)
+    try {
+      const consent = page.getByRole("button", {
+        name: /allow all cookies|accept all|allow essential|only allow essential|accept/i,
+      });
+      if (await consent.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+        await consent.first().click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(1500);
+      }
+    } catch { /* no dialog */ }
+
+    // Scroll until Meta stops serving NEW ads (stream exhausted), not until the
+    // filter stops adding rows.
+    let idleScrolls = 0;
+    const idleLimit = cfg.maxIdleScrolls;
+    while (results.size < cfg.max && idleScrolls < idleLimit) {
+      let newRaw = 0;
+      for (const node of rawNodes.splice(0)) {
+        const lead = normalizeAd(node);
+        if (!lead.adArchiveId) continue;
+        if (!seenArchive.has(lead.adArchiveId)) { seenArchive.add(lead.adArchiveId); newRaw++; }
+        if (parsed.required.length && !matchesRequired(parsed.required, leadSearchText(lead))) continue;
+        const key = leadKey(lead);
+        if (results.has(key)) continue;
+        if (seenKeys.has(key)) continue;
+        results.set(key, lead);
+        console.log(
+          `  + [${term}] #${results.size} (${mediaType}) ${lead.companyName || "?"}` +
+          ` | ${lead.website || lead.landingPage || lead.displayUrl || "no site"}`,
+        );
+      }
+      idleScrolls = newRaw > 0 ? 0 : idleScrolls + 1;
+
+      await page.evaluate(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        for (let i = 0; i < 4; i++) {
+          const h = (document.body && document.body.scrollHeight)
+            || document.documentElement.scrollHeight || 100000;
+          window.scrollTo(0, h);
+          await sleep(400);
+        }
+      }).catch(() => {});
+      await page.waitForTimeout(cfg.scrollDelayMs);
+    }
+
+    console.log(`  [${term}] (${mediaType}) pass done — scanned ${seenArchive.size} ads total → ${results.size} unique kept`);
+    await context.close().catch(() => {});
   }
 
-  console.log(`  [${term}] scanned ${seenArchive.size} ads → ${results.size} unique advertiser(s) kept`);
-
-  // When a term yields nothing, report WHAT the page showed so we can tell a
-  // genuine "no ads" from a login wall / block / unaccepted consent (typical
-  // when Facebook serves a datacenter IP differently than a residential one).
-  if (results.size === 0) {
-    let title = "", bodyText = "", finalUrl = "";
-    try { finalUrl = page.url(); } catch {}
-    try { title = await page.title(); } catch {}
-    try { bodyText = (await page.evaluate(() => document.body?.innerText || "")).slice(0, 400); } catch {}
-    const lc = bodyText.toLowerCase();
-    // NOTE: a bare "log in" link is ALWAYS in the Ads Library header — it is not
-    // evidence of a wall. Only treat explicit "must log in" prompts as a wall.
-    const signal =
-      finalUrl.startsWith("chrome-error") || !loaded
-        ? "PAGE FAILED TO LOAD via proxy (slow/dead residential IP) — retry or use a ROTATING proxy" :
-      /you must log in|log in to continue|log in to see/.test(lc) ? "LOGIN REQUIRED (IP flagged)" :
-      /allow.*cookies|cookies policy|accept cookies/.test(lc) ? "COOKIE CONSENT not dismissed" :
-      /isn'?t available|not available|something went wrong|try again later/.test(lc) ? "BLOCKED / UNAVAILABLE" :
-      /no ads? match/.test(lc) ? "GENUINELY EMPTY (no ads match this search)" :
-      gqlResponses === 0 ? "NO GraphQL fired (page never searched — blocked/JS-gated)" :
-      "RESULTS SUPPRESSED — search ran but returned no ads (datacenter IP likely; set a residential PROXY_URL)";
-    // Decisive split: did ANY GraphQL body actually carry ad data?
-    const dataSignal =
-      gqlWithAdData > 0
-        ? `FB RETURNED AD DATA in ${gqlWithAdData} response(s) but parser extracted 0 — PARSING ISSUE (proxy won't help)`
-        : gqlReadErrors > 0
-        ? `${gqlReadErrors} response bodies unreadable — could not inspect (try again)`
-        : "NO response contained ad data — FB returned empty results (IP suppression; residential PROXY_URL needed)";
-    console.log(
-      `  [${term}] 0 leads — diagnostic: ${signal} | graphqlResponses=${gqlResponses}` +
-      ` | withAdData=${gqlWithAdData} | readErrors=${gqlReadErrors} | title="${title}" | url=${finalUrl}`,
-    );
-    console.log(`  [${term}] verdict: ${dataSignal}`);
-    console.log(`  [${term}] page text: ${bodyText.replace(/\s+/g, " ").trim().slice(0, 250)}`);
+  for (const mt of mediaTypes) {
+    if (results.size >= cfg.max) break;
+    await runPass(mt);
   }
 
-  await context.close();
+  console.log(`  [${term}] scanned ${seenArchive.size} ads → ${results.size} unique advertiser(s) kept (media: ${mediaTypes.join("+")})`);
 
   // mark these as seen so other terms running later don't re-add them
   for (const key of results.keys()) seenKeys.add(key);
 
-  const leads = [...results.values()].slice(0, cfg.max).map((l) => ({
-    ...l,
-    sourceTerm: term,
-  }));
-  return leads;
+  return [...results.values()].slice(0, cfg.max).map((l) => ({ ...l, sourceTerm: term }));
 }
 
 // ---------------------------------------------------------------------------
@@ -867,6 +832,7 @@ function parseArgs(argv) {
       case "--country": args.country = next(); break;
       case "--max": args.max = parseInt(next(), 10); break;
       case "--idle": args.maxIdleScrolls = parseInt(next(), 10); break;
+      case "--media": args.mediaTypes = next().split(",").map((s) => s.trim()).filter(Boolean); break;
       case "--attempts": args.maxAttempts = parseInt(next(), 10); break;
       case "--gql-wait": args.gqlWaitSec = parseInt(next(), 10); break;
       case "--concurrency": args.concurrency = parseInt(next(), 10); break;
