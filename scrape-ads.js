@@ -26,6 +26,11 @@
 
 import { chromium } from "playwright";
 import { writeFile, readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
 // 1. CONFIG (override any of these via CLI flags)
@@ -492,10 +497,31 @@ function parseProxyLine(line) {
 
 function loadProxies() {
   const out = [];
-  for (const line of (process.env.PROXY_LIST || "").split(/[\r\n,]+/)) {
-    const p = parseProxyLine(line);
-    if (p) out.push(p);
+  const pushLines = (text) => {
+    for (const line of (text || "").split(/[\r\n,]+/)) {
+      const p = parseProxyLine(line);
+      if (p) out.push(p);
+    }
+  };
+
+  pushLines(process.env.PROXY_LIST);
+
+  // Fallback: a local proxies file, so the server never accidentally scrapes on
+  // the host IP just because the PROXY_LIST env var wasn't set. Looks next to the
+  // script (PROXY_FILE overrides the filename).
+  if (!out.length) {
+    const file = process.env.PROXY_FILE || "proxies.local.txt";
+    for (const candidate of [file, path.join(SCRIPT_DIR, file)]) {
+      try {
+        pushLines(readFileSync(candidate, "utf8"));
+        if (out.length) {
+          console.log(`Loaded proxies from file: ${candidate}`);
+          break;
+        }
+      } catch { /* file not present — try next */ }
+    }
   }
+
   if (!out.length && process.env.PROXY_URL) {
     out.push({
       server: process.env.PROXY_URL,
@@ -893,7 +919,11 @@ async function main() {
   if (cfg.proxies.length) {
     console.log(`Loaded ${cfg.proxies.length} proxy endpoint(s); rotating per attempt.`);
   } else {
-    console.log("No proxy configured (set PROXY_LIST or PROXY_URL) — using the host IP directly.");
+    console.log("==================================================================");
+    console.log("⚠️  NO PROXY CONFIGURED — scraping on the HOST IP. Facebook will");
+    console.log("⚠️  throttle it fast and results will be heavily capped (~few hundred).");
+    console.log("⚠️  Set PROXY_LIST, or drop a proxies.local.txt next to scrape-ads.js.");
+    console.log("==================================================================");
   }
 
   // --no-sandbox is required when running as root inside a container (Render,
