@@ -14,6 +14,8 @@
  * that store and merge the phones in.
  */
 
+import { randomUUID } from "node:crypto";
+
 const APOLLO_KEY = process.env.APOLLO_API_KEY || "Y3Cgva_5pRELow2hjrjGuA";
 const APOLLO = "https://api.apollo.io/api/v1";
 
@@ -49,6 +51,11 @@ function rankPerson(p) {
   const t = String(p.title || "").toLowerCase();
   for (let i = 0; i < DM_RANK.length; i++) if (t.includes(DM_RANK[i])) return i;
   return 999;
+}
+// Never return these — they're staff/admin, not decision-makers.
+const EXCLUDE_TITLE = /\b(assistant|coordinator|receptionist|secretary|intern|administrative|office manager|scheduler|front desk|bookkeeper|paralegal|clerk|associate attorney|sales rep|customer service|support)\b/i;
+function isExcludedTitle(t) {
+  return EXCLUDE_TITLE.test(String(t || ""));
 }
 
 function hostOf(raw) {
@@ -170,25 +177,31 @@ async function enrichLead(lead, opts = {}) {
 
   await sleep(200);
 
-  // Step 2 — find a decision-maker by domain
+  // Step 2 — find a decision-maker by domain, filtered to the US (we only want
+  // US leads; without this, offshore staff of a US firm — UK/PH VAs — slip in).
+  const US_LOCATIONS = ["United States"];
   let person = null;
   try {
     let people = [];
     if (peopleDomain) {
       people = (await apolloPost("/mixed_people/api_search", {
-        q_organization_domains_list: [peopleDomain], person_titles: PERSON_TITLES, page: 1, per_page: 10,
+        q_organization_domains_list: [peopleDomain], person_titles: PERSON_TITLES, person_locations: US_LOCATIONS, page: 1, per_page: 10,
       }))?.people || [];
       if (!people.length) {
         await sleep(200);
         people = (await apolloPost("/mixed_people/api_search", {
-          q_organization_domains_list: [peopleDomain], page: 1, per_page: 10,
+          q_organization_domains_list: [peopleDomain], person_locations: US_LOCATIONS, page: 1, per_page: 10,
         }))?.people || [];
       }
     }
     if (!people.length) {
       await sleep(200);
-      people = (await apolloPost("/mixed_people/api_search", { organization_ids: [orgId], page: 1, per_page: 10 }))?.people || [];
+      people = (await apolloPost("/mixed_people/api_search", {
+        organization_ids: [orgId], person_locations: US_LOCATIONS, page: 1, per_page: 10,
+      }))?.people || [];
     }
+    // drop staff/admin titles (assistants, coordinators, etc.) — never our target
+    people = people.filter((p) => !isExcludedTitle(p.title));
     people.sort((a, b) => rankPerson(a) - rankPerson(b));
     person = people.find((p) => rankPerson(p) < 999 && isRealEmail(String(p.email || "")))
       || people.find((p) => rankPerson(p) < 999) || people[0] || null;
@@ -209,7 +222,9 @@ async function enrichLead(lead, opts = {}) {
   let email = isRealEmail(String(person.email || "")) ? person.email : null;
   let personalEmail = null;
   const personId = person.id || null;
-  const location = [person.city, person.state].filter(Boolean).join(", ") || null;
+  let city = person.city || null;
+  let state = person.state || null;
+  let country = person.country || null;
   let phoneRequestId = null;
 
   // Step 3 — match to unlock email (+ phone async)
@@ -218,12 +233,14 @@ async function enrichLead(lead, opts = {}) {
     try {
       const params = { id: personId, reveal_personal_emails: "true" };
       if (opts.revealPhones && opts.webhookUrl) {
+        // Our own id in the webhook URL — Apollo posts back to this exact URL, so
+        // we read `rid` from the query string instead of guessing the body shape.
+        phoneRequestId = randomUUID();
         params.reveal_phone_number = "true";
-        params.webhook_url = opts.webhookUrl;
+        params.webhook_url = `${opts.webhookUrl}?rid=${phoneRequestId}`;
       }
       const m = await apolloMatch(params);
       const matched = m?.person;
-      if (m?.request_id != null) phoneRequestId = String(m.request_id);
       if (matched) {
         if (isRealEmail(String(matched.email || ""))) email = matched.email;
         const pe = Array.isArray(matched.personal_emails) ? matched.personal_emails[0] : null;
@@ -231,14 +248,25 @@ async function enrichLead(lead, opts = {}) {
         if (!lastName) lastName = matched.last_name || null;
         if (!linkedin) linkedin = matched.linkedin_url || null;
         if (!phone) phone = pickPhone(matched.phone_numbers || []);
+        city = matched.city || city;
+        state = matched.state || state;
+        country = matched.country || country;
       }
     } catch (e) {
+      const loc = [city, state].filter(Boolean).join(", ") || null;
       return { lead: { ...base, apolloStatus: "partial", apolloOrgId: orgId, founderFirstName: firstName,
         founderLastName: lastName, founderTitle: title, founderLinkedIn: linkedin, founderCompany: orgName,
-        founderIndustry: industry, founderLocation: location, founderPhone: phone, apolloError: `match: ${e.message}` } };
+        founderIndustry: industry, founderLocation: loc, founderPhone: phone, apolloError: `match: ${e.message}` } };
     }
   }
 
+  // Safety net: if the match reveals a non-US person, reject (US-only target).
+  if (country && !/united states|usa|^us$/i.test(country)) {
+    return { lead: { ...base, apolloStatus: "non_us", apolloOrgId: orgId, founderCompany: orgName,
+      founderIndustry: industry, apolloError: `person country = ${country}` } };
+  }
+
+  const location = [city, state].filter(Boolean).join(", ") || null;
   return {
     lead: {
       ...base,

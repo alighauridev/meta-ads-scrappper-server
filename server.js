@@ -51,7 +51,9 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL ||
 app.post("/apollo/webhook", (req, res) => {
   try {
     const body = req.body || {};
-    const reqId = body.request_id ?? body.requestId ?? body.id;
+    // We embed our own `rid` in the webhook URL query string; prefer it. Fall
+    // back to whatever id Apollo includes in the body.
+    const reqId = req.query.rid ?? body.request_id ?? body.requestId ?? body.id;
     const people = body.people || (body.person ? [body.person] : []) || [];
     const nums = [];
     for (const p of people) {
