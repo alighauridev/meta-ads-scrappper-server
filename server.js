@@ -105,22 +105,51 @@ app.post("/scrape/start", async (req, res) => {
   const jobId = randomUUID();
   const outPath = path.join(JOBS_DIR, `${jobId}.json`);
   await mkdir(JOBS_DIR, { recursive: true });
-  jobs.set(jobId, { status: "running", leadCount: 0, outPath, startedAt: Date.now() });
+  jobs.set(jobId, {
+    status: "running", leadCount: 0, outPath, startedAt: Date.now(), finishedAt: null,
+    term, max, country, enrichPage: !!enrichPage, classify: !!classify,
+  });
 
   // kick off in the background; respond immediately
   runScrape({ term, max, country, enrichPage, classify }, outPath, jobId.slice(0, 8))
     .then(async () => {
       let leads = [];
       try { leads = JSON.parse(await readFile(outPath, "utf8")); } catch {}
-      jobs.set(jobId, { ...jobs.get(jobId), status: "done", leadCount: leads.length });
+      jobs.set(jobId, { ...jobs.get(jobId), status: "done", leadCount: leads.length, finishedAt: Date.now() });
       console.log(`[${jobId.slice(0, 8)}] job done: ${leads.length} leads`);
     })
     .catch((err) => {
-      jobs.set(jobId, { ...jobs.get(jobId), status: "error", error: err.message });
+      jobs.set(jobId, { ...jobs.get(jobId), status: "error", error: err.message, finishedAt: Date.now() });
       console.error(`[${jobId.slice(0, 8)}] job error: ${err.message}`);
     });
 
   res.json({ jobId, status: "running" });
+});
+
+// ---- GET /jobs  (monitoring: list all jobs, newest first) ---------------
+app.get("/jobs", (_req, res) => {
+  const now = Date.now();
+  const list = [...jobs.entries()]
+    .map(([jobId, j]) => ({
+      jobId,
+      status: j.status,
+      term: j.term ?? null,
+      max: j.max ?? null,
+      country: j.country ?? null,
+      leadCount: j.leadCount ?? 0,
+      error: j.error ?? null,
+      startedAt: j.startedAt,
+      finishedAt: j.finishedAt ?? null,
+      elapsedSec: Math.round(((j.finishedAt ?? now) - j.startedAt) / 1000),
+    }))
+    .sort((a, b) => b.startedAt - a.startedAt);
+  res.json({
+    running: list.filter((j) => j.status === "running").length,
+    done: list.filter((j) => j.status === "done").length,
+    error: list.filter((j) => j.status === "error").length,
+    total: list.length,
+    jobs: list,
+  });
 });
 
 // ---- GET /scrape/status/:jobId ------------------------------------------

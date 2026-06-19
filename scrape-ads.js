@@ -37,8 +37,10 @@ const DEFAULTS = {
   classify: false,    // fetch landing pages and tag opt-in / vsl / booking
   headless: true,
   out: "leads.json",
-  // stop scrolling a term once this many consecutive scrolls add nothing new
-  maxIdleScrolls: 4,
+  // stop scrolling a term once this many consecutive scrolls add nothing new.
+  // Higher = digs deeper into Meta's result set before giving up (more leads,
+  // slower). Override with --idle. Filtered (AND/phrase) terms multiply this.
+  maxIdleScrolls: parseInt(process.env.SCRAPE_IDLE_SCROLLS || "8", 10),
   scrollDelayMs: 1800, // give GraphQL pagination time to fire + return
   navTimeoutMs: 60000,
   // How many fresh proxy IPs to try before giving up on a term. Residential
@@ -67,9 +69,11 @@ const DEFAULTS = {
 //   "book a call"        -> EXACT PHRASE (Meta's "Search this exact phrase")
 // Commas separate independent searches (OR / union) and are split earlier, so a
 // single `term` here is one Meta search.
+// True only when quotes wrap the WHOLE term with nothing quoted inside — so
+// `"strategy session"` is a phrase, but `"a" AND "b"` is not (two phrases).
 function isQuoted(s) {
   const t = s.trim();
-  return /^".+"$/.test(t) || /^'.+'$/.test(t);
+  return /^"[^"]+"$/.test(t) || /^'[^']+'$/.test(t);
 }
 
 // Break a term into the substrings that must ALL appear in the ad:
@@ -264,7 +268,7 @@ function getAdCopy(snap) {
   ];
   for (const cand of candidates) {
     const ok = usableText(cand);
-    if (ok) return ok.slice(0, 600);
+    if (ok) return ok.slice(0, 2000); // keep enough text so the keyword filter sees the whole ad
   }
   return null;
 }
@@ -639,38 +643,48 @@ async function scrapeTerm(browser, term, cfg, seenKeys) {
     }
   } catch { /* no dialog */ }
 
+  // Keep scrolling as long as Meta keeps serving NEW ads. The stop condition is
+  // "Meta served no new ad for N scrolls" (its stream is exhausted) — NOT "no new
+  // lead passed the filter". Otherwise a filtered search quits while Meta still
+  // has thousands more ads to page through.
+  const seenArchive = new Set();   // every raw ad id we've seen (matched or not)
   let idleScrolls = 0;
-  // Filtering rejects many ads, so scroll deeper before giving up on a term.
-  const idleLimit = parsed.required.length ? cfg.maxIdleScrolls * 3 : cfg.maxIdleScrolls;
+  const idleLimit = cfg.maxIdleScrolls;
   while (results.size < cfg.max && idleScrolls < idleLimit) {
-    // fold whatever we've intercepted so far into results
-    const before = results.size;
+    let newRaw = 0;
     for (const node of rawNodes.splice(0)) {
       const lead = normalizeAd(node);
       if (!lead.adArchiveId) continue;
+      if (!seenArchive.has(lead.adArchiveId)) { seenArchive.add(lead.adArchiveId); newRaw++; }
       // keep only ads whose text actually contains the searched keyword(s)
       if (parsed.required.length && !matchesRequired(parsed.required, leadSearchText(lead))) continue;
       const key = leadKey(lead);
-      if (results.has(key)) continue;       // duplicate within this term
+      if (results.has(key)) continue;       // duplicate advertiser within this term
       if (seenKeys.has(key)) continue;       // already seen globally / existing
       results.set(key, lead);
-      // one-by-one progress: log each unique lead as it is captured
       console.log(
         `  + [${term}] #${results.size} ${lead.companyName || "?"}` +
         ` | ${lead.website || lead.landingPage || lead.displayUrl || "no site"}`,
       );
     }
-    idleScrolls = results.size > before ? 0 : idleScrolls + 1;
+    // idle only when Meta gave us nothing new this round (stream exhausted)
+    idleScrolls = newRaw > 0 ? 0 : idleScrolls + 1;
 
-    // scroll to trigger the next GraphQL pagination batch (guard against a
-    // not-yet-ready body, and never let a transient scroll error kill the run)
-    await page.evaluate(() => {
-      const h = (document.body && document.body.scrollHeight)
-        || document.documentElement.scrollHeight || 100000;
-      window.scrollTo(0, h);
+    // Incremental scrolls reliably trigger Meta's infinite-scroll pagination —
+    // a single jump to the bottom sometimes loads only one batch.
+    await page.evaluate(async () => {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      for (let i = 0; i < 4; i++) {
+        const h = (document.body && document.body.scrollHeight)
+          || document.documentElement.scrollHeight || 100000;
+        window.scrollTo(0, h);
+        await sleep(400);
+      }
     }).catch(() => {});
     await page.waitForTimeout(cfg.scrollDelayMs);
   }
+
+  console.log(`  [${term}] scanned ${seenArchive.size} ads → ${results.size} unique advertiser(s) kept`);
 
   // When a term yields nothing, report WHAT the page showed so we can tell a
   // genuine "no ads" from a login wall / block / unaccepted consent (typical
