@@ -200,11 +200,12 @@ async function enrichLead(lead, opts = {}) {
         organization_ids: [orgId], person_locations: US_LOCATIONS, page: 1, per_page: 10,
       }))?.people || [];
     }
-    // drop staff/admin titles (assistants, coordinators, etc.) — never our target
-    people = people.filter((p) => !isExcludedTitle(p.title));
+    // Only return a real decision-maker (owner/founder/partner/principal/managing/
+    // C-suite). NO "take anyone" fallback — that was returning plain attorneys,
+    // marketing/ops directors, intake managers, etc. If none qualify -> no_person.
+    people = people.filter((p) => !isExcludedTitle(p.title) && rankPerson(p) < 999);
     people.sort((a, b) => rankPerson(a) - rankPerson(b));
-    person = people.find((p) => rankPerson(p) < 999 && isRealEmail(String(p.email || "")))
-      || people.find((p) => rankPerson(p) < 999) || people[0] || null;
+    person = people.find((p) => isRealEmail(String(p.email || ""))) || people[0] || null;
   } catch (e) {
     return { lead: { ...base, apolloStatus: "search_failed", apolloOrgId: orgId, founderCompany: orgName,
       founderIndustry: industry, apolloError: `people: ${e.message}` } };
