@@ -153,7 +153,7 @@ app.post("/scrape/start", async (req, res) => {
   jobs.set(jobId, {
     status: "running", leadCount: 0, outPath, startedAt: Date.now(), finishedAt: null,
     term, max, country, enrichPage: !!enrichPage, classify: !!classify,
-    enrich: !!enrich, revealPhones: !!revealPhones,
+    apolloEnrich: doApollo, revealPhones: !!revealPhones,
   });
 
   // kick off in the background; respond immediately
@@ -163,7 +163,7 @@ app.post("/scrape/start", async (req, res) => {
       try { leads = JSON.parse(await readFile(outPath, "utf8")); } catch {}
 
       // Optional Apollo enrichment, returned in the same job result.
-      if (enrich && leads.length) {
+      if (doApollo && leads.length) {
         jobs.set(jobId, { ...jobs.get(jobId), status: "enriching", leadCount: leads.length });
         console.log(`[${tag}] enriching ${leads.length} leads with Apollo${revealPhones ? " (+phones)" : ""}…`);
         const webhookUrl = PUBLIC_URL ? `${PUBLIC_URL}/apollo/webhook` : "";
