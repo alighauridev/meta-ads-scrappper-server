@@ -8,3 +8,6 @@ leads*.json
 web/node_modules/
 web/.next/
 web/out/
+
+# local proxy credentials — never commit
+proxies.local.txt
